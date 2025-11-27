@@ -22,6 +22,7 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --mesh-uuid UUID       Mesh UUID (default: pulled from registry or generated)
   --registry-port PORT   Registry HTTP port (default 9000)
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
+  --refresh-only         Only refresh configs from registry (no install/register)
   -h                     Help
 EOF
 }
@@ -29,7 +30,7 @@ EOF
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 
 SERVER_ADDR=""; MESH_IP=""; TOKEN=""; NAME=""; PUB_ADDR="";
-VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID=""; REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"
+VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID=""; REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,24 +46,53 @@ while [[ $# -gt 0 ]]; do
     --mesh-uuid) MESH_UUID="$2"; shift 2;;
     --registry-port) REG_PORT="$2"; shift 2;;
     --reality-dest) REALITY_DEST="$2"; shift 2;;
+    --refresh-only) REFRESH_ONLY=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
 done
+if [[ $REFRESH_ONLY -eq 0 ]]; then
+  [[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
+else
+  # load config for refresh
+  if [[ -z "$SERVER_ADDR" && -f /etc/vless-mesh/config.json ]]; then
+    SERVER_ADDR=$(jq -r '.server_addr' /etc/vless-mesh/config.json)
+  fi
+  [[ -n "$SERVER_ADDR" ]] || { echo "refresh: server_addr missing"; exit 1; }
+fi
 
-[[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
 need_root
 
-apt-get update -qq
-apt-get install -yq tinc curl jq python3 python3-cryptography >/dev/null
-command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+if [[ $REFRESH_ONLY -eq 0 ]]; then
+  apt-get update -qq
+  apt-get install -yq tinc curl jq python3 python3-cryptography >/dev/null
+  command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+fi
 
 NAME=${NAME:-$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')}
 PUB_ADDR=${PUB_ADDR:-$(hostname -I | awk '{print $1}')}
 DEST_HOST=${REALITY_DEST%%:*}
 
-# Reality keys for this node
+CONFIG_JSON=/etc/vless-mesh/config.json
 SELF_JSON=/etc/vless-mesh/self.json
+
+if [[ -f $CONFIG_JSON ]]; then
+  [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(jq -r '.server_addr' $CONFIG_JSON)
+  [[ -z "$MESH_IP" ]] && MESH_IP=$(jq -r '.mesh_ip' $CONFIG_JSON)
+  [[ -z "$PUB_ADDR" || "$PUB_ADDR" == "" ]] && PUB_ADDR=$(jq -r '.pub_addr' $CONFIG_JSON)
+  [[ -z "$TOKEN" ]] && TOKEN=$(jq -r '.token' $CONFIG_JSON)
+  [[ -z "$MESH_UUID" || "$MESH_UUID" == "" ]] && MESH_UUID=$(jq -r '.mesh_uuid' $CONFIG_JSON)
+  VLESS_PORT=$(jq -r '.vless_port' $CONFIG_JSON)
+  TINC_PORT=$(jq -r '.tinc_port' $CONFIG_JSON)
+  FW_BASE=$(jq -r '.fw_base' $CONFIG_JSON)
+  REG_PORT=$(jq -r '.reg_port' $CONFIG_JSON)
+  REALITY_DEST=$(jq -r '.reality_dest' $CONFIG_JSON)
+  DEST_HOST=${REALITY_DEST%%:*}
+fi
+
+[[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
+
+# Reality keys for this node
 if [[ -f "$SELF_JSON" ]]; then
   REALITY_PRIV=$(jq -r '.reality_priv' "$SELF_JSON")
   REALITY_PUB=$(jq -r '.reality_pub' "$SELF_JSON")
@@ -186,6 +216,21 @@ cat >"$SELF_JSON" <<EOF
   "reality_priv":"$REALITY_PRIV",
   "reality_pub":"$REALITY_PUB",
   "short_id":"$SHORT_ID"
+}
+EOF
+
+cat >"$CONFIG_JSON" <<EOF
+{
+  "server_addr":"$SERVER_ADDR",
+  "mesh_ip":"$MESH_IP",
+  "pub_addr":"$PUB_ADDR",
+  "token":"$TOKEN",
+  "mesh_uuid":"$MESH_UUID",
+  "vless_port":$VLESS_PORT,
+  "tinc_port":$TINC_PORT,
+  "fw_base":$FW_BASE,
+  "reg_port":$REG_PORT,
+  "reality_dest":"$REALITY_DEST"
 }
 EOF
 
@@ -314,6 +359,170 @@ systemctl enable --now xray
 systemctl restart xray
 systemctl enable --now tinc@mesh
 systemctl restart tinc@mesh
+
+# install refresh helper and timer
+cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG=/etc/vless-mesh/config.json
+SELF=/etc/vless-mesh/self.json
+[[ -f $CFG && -f $SELF ]] || exit 0
+server=$(jq -r '.server_addr' $CFG)
+token=$(jq -r '.token' $CFG)
+reg_port=$(jq -r '.reg_port' $CFG)
+mesh_ip=$(jq -r '.mesh_ip' $CFG)
+pub_addr=$(jq -r '.pub_addr' $CFG)
+dest=$(jq -r '.reality_dest' $CFG)
+mesh_uuid=$(jq -r '.mesh_uuid' $CFG)
+name=$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
+vless_port=$(jq -r '.vless_port' $CFG)
+tinc_port=$(jq -r '.tinc_port' $CFG)
+fw_base=$(jq -r '.fw_base' $CFG)
+DEST_HOST=${dest%%:*}
+
+pub_key=$(jq -r '.reality_pub' $SELF)
+short_id=$(jq -r '.short_id' $SELF)
+
+BASE=/etc/tinc/mesh
+HOSTS=$BASE/hosts
+SELF_HOST=$HOSTS/$name
+HOST_B64=$(base64 -w0 "$SELF_HOST")
+
+PEERS_URL="http://$server:$reg_port/peers"
+REG_URL="http://$server:$reg_port/register"
+TMP=$(mktemp)
+
+cat >$TMP <<EOF
+{
+  "name":"$name",
+  "mesh_ip":"$mesh_ip",
+  "pub_addr":"$pub_addr",
+  "vless_port":$vless_port,
+  "reality_pub":"$pub_key",
+  "short_id":"$short_id",
+  "sni":"$DEST_HOST",
+  "tinc_port":$tinc_port,
+  "fw_base":$fw_base,
+  "uuid":"$mesh_uuid",
+  "host_b64":"$HOST_B64"
+}
+EOF
+curl -fsS -H "X-Mesh-Token: $token" -H 'Content-Type: application/json' -X POST -d @$TMP "$REG_URL" -o $TMP
+curl -fsS -H "X-Mesh-Token: $token" "$PEERS_URL" -o $TMP
+cp $TMP /etc/vless-mesh/peers.json
+
+python3 - "$name" "$mesh_uuid" "$SELF" "$DEST_HOST" "$vless_port" "$tinc_port" "$fw_base" "$BASE" "/etc/vless-mesh/peers.json" <<'PY'
+import sys, json, base64, os
+name, mesh_uuid, self_path, dest_host, vless_port, tinc_port, fw_base, base_dir, peers_path = sys.argv[1:10]
+vless_port=int(vless_port); tinc_port=int(tinc_port); fw_base=int(fw_base)
+hosts_dir=os.path.join(base_dir,'hosts')
+with open(self_path) as f: self=json.load(f)
+with open(peers_path) as f: data=json.load(f)
+peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
+
+inbounds=[{
+    "tag":"vless-in",
+    "listen":"0.0.0.0",
+    "port":vless_port,
+    "protocol":"vless",
+    "settings":{
+        "clients":[{"id":mesh_uuid,"level":0}],
+        "decryption":"none"
+    },
+    "streamSettings":{
+        "network":"tcp",
+        "security":"reality",
+        "realitySettings":{
+            "show":False,
+            "dest":dest_host if ':' in dest_host else f"{dest_host}:443",
+            "serverNames":[dest_host],
+            "privateKey":self['reality_priv'],
+            "shortIds":[self['short_id']],
+            "fingerprint":"chrome"
+        }
+    }
+}]
+
+outbounds=[{"tag":"direct","protocol":"freedom"},{"tag":"to-tinc","protocol":"freedom","settings":{"redirect":f"127.0.0.1:{tinc_port}"}}]
+routes=[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]
+
+idx=0
+for p in peers:
+    if p['name']==name:
+        continue
+    port=fw_base+idx; idx+=1
+    inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
+    outbounds.append({
+        "tag":f"out-{p['name']}",
+        "protocol":"vless",
+        "settings":{"vnext":[{"address":p['pub_addr'],"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},
+        "streamSettings":{"network":"tcp","security":"reality","realitySettings":{
+            "publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}
+    })
+    routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"})
+
+cfg={"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}
+os.makedirs('/usr/local/etc/xray', exist_ok=True)
+with open('/usr/local/etc/xray/config.json','w') as f: json.dump(cfg,f,indent=2)
+
+connect_lines=[]; idx=0
+for p in peers:
+    if p['name']==name:
+        continue
+    port=fw_base+idx; idx+=1
+    raw=base64.b64decode(p['host_b64'])
+    text=raw.decode(errors='ignore')
+    rsa_lines=[]; grab=False
+    for line in text.splitlines():
+        if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
+        if grab: rsa_lines.append(line)
+        if line.startswith('-----END RSA PUBLIC KEY-----'): break
+    host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = 127.0.0.1\nPort = {port}\n"+"\n".join(rsa_lines)+"\n"
+    os.makedirs(hosts_dir, exist_ok=True)
+    with open(os.path.join(hosts_dir,p['name']),'w') as hf: hf.write(host_content)
+    connect_lines.append(f"ConnectTo = {p['name']}")
+
+conf_path=os.path.join(base_dir,'tinc.conf')
+with open(conf_path,'r') as cf: lines=[l for l in cf if not l.startswith('ConnectTo = ')]
+with open(conf_path,'w') as cf:
+    cf.writelines(lines)
+    for line in connect_lines:
+        cf.write(line+'\n')
+PY
+
+systemctl restart xray
+systemctl restart tinc@mesh
+REF
+chmod +x /usr/local/sbin/mesh-refresh.sh
+
+cat >/etc/systemd/system/mesh-refresh.service <<EOF
+[Unit]
+Description=Refresh VLESS mesh peers
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mesh-refresh.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/mesh-refresh.timer <<EOF
+[Unit]
+Description=Periodic VLESS mesh refresh
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now mesh-refresh.timer
+systemctl start mesh-refresh.service
 
 cat <<EOF
 Client ready.
