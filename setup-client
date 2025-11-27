@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Simple client: Tinc over VLESS TCP to hub (no P2P)
+
+usage() {
+cat <<'EOF'
+setup-client --bundle-hostfile PATH --uuid UUID --server-addr IP --mesh-ip IP [options]
+  --bundle-hostfile PATH   server host file (or scp from server:/etc/tinc/mesh/hosts/server)
+  --uuid UUID              VLESS UUID from server
+  --server-addr ADDR       server public IP/DNS
+  --mesh-ip IP             mesh /24 address for this client
+  --reality-public-key KEY Reality public key from server
+  --reality-short-id ID    Reality shortId from server
+  --reality-server-name H  Fake SNI/ServerName (default www.microsoft.com)
+  --vless-port PORT        (default 443)
+  --tinc-port PORT         (default 6060)   # local tinc listen
+  --forward-port PORT      (default 6655)   # dokodemo port to capture tinc -> VLESS
+  --mtu MTU                (default 1400)
+  -h                       help
+EOF
+}
+
+need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
+
+HOSTFILE=""; UUID=""; SERVER_ADDR=""; MESH_IP=""; VLESS_PORT=443; TINC_PORT=6060; FW_PORT=6655; MTU=1400
+REALITY_PUB=""; REALITY_SHORT=""; REALITY_SNI="www.microsoft.com"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bundle-hostfile) HOSTFILE="$2"; shift 2;;
+    --uuid) UUID="$2"; shift 2;;
+    --server-addr) SERVER_ADDR="$2"; shift 2;;
+    --mesh-ip) MESH_IP="$2"; shift 2;;
+    --reality-public-key) REALITY_PUB="$2"; shift 2;;
+    --reality-short-id) REALITY_SHORT="$2"; shift 2;;
+    --reality-server-name) REALITY_SNI="$2"; shift 2;;
+    --vless-port) VLESS_PORT="$2"; shift 2;;
+    --tinc-port) TINC_PORT="$2"; shift 2;;
+    --forward-port) FW_PORT="$2"; shift 2;;
+    --mtu) MTU="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown $1"; usage; exit 1;;
+  esac
+done
+[[ -n "$HOSTFILE" && -n "$UUID" && -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$REALITY_PUB" && -n "$REALITY_SHORT" ]] || { usage; exit 1; }
+
+need_root
+apt-get update -qq
+apt-get install -yq tinc curl jq >/dev/null
+command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+
+BASE=/etc/tinc/mesh
+rm -rf "$BASE"
+mkdir -p "$BASE/hosts"
+
+# Re-write server host file to point to local dokodemo port (so tinc talks to xray, not directly)
+cat "$HOSTFILE" | \
+  awk -v fw="$FW_PORT" 'BEGIN{addr=0;port=0} /^Address/{addr=1;next} /^Port/{port=1;next} {print} END{print "Address = 127.0.0.1"; print "Port = "fw}' >"$BASE/hosts/server"
+
+cat >"$BASE/tinc.conf" <<EOF
+Name = $(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
+Interface = mesh0
+Mode = switch
+Device = /dev/net/tun
+Port = $TINC_PORT
+TCPOnly = yes
+ConnectTo = server
+EOF
+
+cat >"$BASE/tinc-up" <<EOF
+#!/bin/sh
+IF=mesh0
+ip link set \$IF up
+ip addr add $MESH_IP/24 dev \$IF
+ip link set dev \$IF mtu $MTU
+EOF
+cat >"$BASE/tinc-down" <<EOF
+#!/bin/sh
+IF=mesh0
+ip addr del $MESH_IP/24 dev \$IF 2>/dev/null || true
+ip link set \$IF down || true
+EOF
+chmod +x "$BASE/tinc-up" "$BASE/tinc-down"
+
+rm -f "$BASE/rsa_key.priv"
+tincd -n mesh -K4096 <<EOF
+y
+EOF
+SELF=$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
+PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/$SELF")
+cat >"$BASE/hosts/$SELF" <<EOF
+Subnet = $MESH_IP/32
+EOF
+echo "$PUBK" >>"$BASE/hosts/$SELF"
+
+cat >/usr/local/etc/xray/config.json <<EOF
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[
+    {
+      "tag":"tinc-in",
+      "listen":"127.0.0.1",
+      "port":$FW_PORT,
+      "protocol":"dokodemo-door",
+      "settings":{"network":"tcp"}
+    }
+  ],
+  "outbounds":[
+    {
+      "tag":"vless-out",
+      "protocol":"vless",
+      "settings":{
+        "vnext":[{
+          "address":"$SERVER_ADDR",
+          "port":$VLESS_PORT,
+          "users":[{"id":"$UUID","encryption":"none"}]
+        }]
+      },
+      "streamSettings":{
+        "network":"tcp",
+        "security":"reality",
+        "realitySettings":{
+          "publicKey":"$REALITY_PUB",
+          "shortId":"$REALITY_SHORT",
+          "serverName":"$REALITY_SNI",
+          "fingerprint":"chrome"
+        }
+      }
+    }
+  ],
+  "routing":{"rules":[{"type":"field","inboundTag":["tinc-in"],"outboundTag":"vless-out"}]}
+}
+EOF
+
+echo mesh >/etc/tinc/nets.boot
+systemctl enable --now xray
+systemctl enable --now tinc@mesh
+
+cat <<EOF
+Client ready. Host files in $BASE/hosts
+  Mesh IP: $MESH_IP
+  Server: $SERVER_ADDR:$VLESS_PORT UUID=$UUID
+EOF

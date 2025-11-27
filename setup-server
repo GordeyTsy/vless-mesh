@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# VLESS Reality (PQ-capable) + Tinc hub server
+# Usage: setup-server --mesh-ip 10.10.0.1 --pub-addr 1.2.3.4 [--vless-port 443] [--tinc-port 6060] [--mtu 1400]
+
+usage() {
+cat <<'EOF'
+setup-server --mesh-ip IP --pub-addr ADDR [options]
+  --mesh-ip IP       Mesh /24 address of server (required)
+  --pub-addr ADDR    Public IP/DNS clients reach (required)
+  --vless-port PORT  VLESS listen port (default 443)
+  --tinc-port PORT   Tinc TCP port (default 6060)
+  --mtu MTU          MTU for mesh0 (default 1400)
+  --reality-dest H:P Fake SNI/DEST for Reality (default www.microsoft.com:443)
+  --uuid UUID        VLESS UUID (default generate)
+  -h                 help
+EOF
+}
+
+need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
+
+MESH_IP=""; PUB_ADDR=""; VLESS_PORT=443; TINC_PORT=6060; MTU=1400; UUID=""; REALITY_DEST="www.microsoft.com:443"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mesh-ip) MESH_IP="$2"; shift 2;;
+    --pub-addr) PUB_ADDR="$2"; shift 2;;
+    --vless-port) VLESS_PORT="$2"; shift 2;;
+    --tinc-port) TINC_PORT="$2"; shift 2;;
+    --mtu) MTU="$2"; shift 2;;
+    --reality-dest) REALITY_DEST="$2"; shift 2;;
+    --uuid) UUID="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown $1"; usage; exit 1;;
+  esac
+done
+[[ -n "$MESH_IP" && -n "$PUB_ADDR" ]] || { usage; exit 1; }
+UUID=${UUID:-$(uuidgen)}
+
+need_root
+apt-get update -qq
+apt-get install -yq tinc curl jq python3-cryptography >/dev/null
+command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+
+# Reality keypair (X25519) for server; shortId 8 hex chars
+# reality key generation (supports both "Private key" and "PrivateKey" outputs)
+REALITY_KEYPAIR=$(xray x25519 || true)
+REALITY_PRIV=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Private key|PrivateKey/{print $3}')
+REALITY_PUB=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Public key|PublicKey/{print $3}')
+
+if [[ -z "$REALITY_PRIV" || -z "$REALITY_PUB" ]]; then
+  # Fallback: generate X25519 with python to ensure Reality keys exist
+  PY_KEYS=$(python3 - <<'PY'
+import base64
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+priv = X25519PrivateKey.generate()
+pub = priv.public_key()
+enc = lambda b: base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+
+print(enc(priv.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption()
+)))
+
+print(enc(pub.public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)))
+PY
+  )
+  REALITY_PRIV=$(printf "%s" "$PY_KEYS" | sed -n '1p')
+  REALITY_PUB=$(printf "%s" "$PY_KEYS" | sed -n '2p')
+fi
+
+SHORT_ID=$(openssl rand -hex 4)
+DEST_HOST=${REALITY_DEST%%:*}
+
+BASE=/etc/tinc/mesh
+rm -rf "$BASE"
+mkdir -p "$BASE/hosts"
+
+cat >"$BASE/tinc.conf" <<EOF
+Name = server
+Interface = mesh0
+Mode = switch
+Device = /dev/net/tun
+Port = $TINC_PORT
+TCPOnly = yes
+EOF
+
+cat >"$BASE/tinc-up" <<EOF
+#!/bin/sh
+IF=mesh0
+ip link set \$IF up
+ip addr add $MESH_IP/24 dev \$IF
+ip link set dev \$IF mtu $MTU
+EOF
+cat >"$BASE/tinc-down" <<EOF
+#!/bin/sh
+IF=mesh0
+ip addr del $MESH_IP/24 dev \$IF 2>/dev/null || true
+ip link set \$IF down || true
+EOF
+chmod +x "$BASE/tinc-up" "$BASE/tinc-down"
+
+rm -f "$BASE/rsa_key.priv"
+tincd -n mesh -K4096 <<EOF
+y
+EOF
+PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/server")
+cat >"$BASE/hosts/server" <<EOF
+Subnet = $MESH_IP/32
+Address = 127.0.0.1
+Port = $TINC_PORT
+$PUBK
+EOF
+
+# Xray: inbound VLESS Reality (PQ-capable), outbound freedom redirect to local tinc
+cat >/usr/local/etc/xray/config.json <<EOF
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[
+    {
+      "tag":"vless-in",
+      "listen":"0.0.0.0",
+      "port":$VLESS_PORT,
+      "protocol":"vless",
+      "settings":{
+        "clients":[{"id":"$UUID","level":0}],
+        "decryption":"none"
+      },
+      "streamSettings":{
+        "network":"tcp",
+        "security":"reality",
+        "realitySettings":{
+          "show":false,
+          "dest":"$REALITY_DEST",
+          "serverNames":["$DEST_HOST"],
+          "privateKey":"$REALITY_PRIV",
+          "shortIds":["$SHORT_ID"],
+          "fingerprint":"chrome"
+        }
+      }
+    }
+  ],
+  "outbounds":[
+    {
+      "tag":"to-tinc",
+      "protocol":"freedom",
+      "settings":{"redirect":"127.0.0.1:$TINC_PORT"}
+    }
+  ],
+  "routing":{"rules":[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]}
+}
+EOF
+
+echo mesh >/etc/tinc/nets.boot
+systemctl enable --now tinc@mesh
+systemctl enable --now xray
+
+cat <<EOF
+Server ready.
+  Public VLESS: $PUB_ADDR:$VLESS_PORT
+  UUID: $UUID
+  Reality public key: $REALITY_PUB
+  Reality shortId: $SHORT_ID
+  Reality dest / SNI: $REALITY_DEST (serverName=$DEST_HOST)
+  Tinc host file: /etc/tinc/mesh/hosts/server
+Distribute the host file and UUID to clients.
+EOF
