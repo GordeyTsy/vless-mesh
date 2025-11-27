@@ -1,70 +1,113 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple client: Tinc over VLESS TCP to hub (no P2P)
+# Full-mesh client (also works for server nodes):
+# - registers itself in server registry (HTTP token)
+# - fetches peers list (with host keys, reality keys)
+# - builds per-peer VLESS Reality outbounds and dokodemo inbounds
+# - rewrites tinc host files to use local dokodemo ports for every peer
 
 usage() {
 cat <<'EOF'
-setup-client --bundle-hostfile PATH --uuid UUID --server-addr IP --mesh-ip IP [options]
-  --bundle-hostfile PATH   server host file (or scp from server:/etc/tinc/mesh/hosts/server)
-  --uuid UUID              VLESS UUID from server
-  --server-addr ADDR       server public IP/DNS
-  --mesh-ip IP             mesh /24 address for this client
-  --reality-public-key KEY Reality public key from server
-  --reality-short-id ID    Reality shortId from server
-  --reality-server-name H  Fake SNI/ServerName (default www.microsoft.com)
-  --vless-port PORT        (default 443)
-  --tinc-port PORT         (default 6060)   # local tinc listen
-  --forward-port PORT      (default 6655)   # dokodemo port to capture tinc -> VLESS
-  --mtu MTU                (default 1400)
-  -h                       help
+setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
+  --server-addr ADDR     Registry+peer node address (HTTP + VLESS) (required)
+  --mesh-ip IP           Mesh /24 address for this node (required)
+  --token TOKEN          Shared registry token from server (required)
+  --name NAME            Node name (default: hostname)
+  --pub-addr ADDR        Public/DNS other peers use to reach this node (default: auto eth0 IPv4)
+  --vless-port PORT      VLESS listen port (default 443)
+  --tinc-port PORT       Local tinc port (default 6060)
+  --fw-base PORT         Base dokodemo port per-peer (default 7000)
+  --mtu MTU              Mesh interface MTU (default 1400)
+  --mesh-uuid UUID       Mesh UUID (default: pulled from registry or generated)
+  --registry-port PORT   Registry HTTP port (default 9000)
+  --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
+  -h                     Help
 EOF
 }
 
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 
-HOSTFILE=""; UUID=""; SERVER_ADDR=""; MESH_IP=""; VLESS_PORT=443; TINC_PORT=6060; FW_PORT=6655; MTU=1400
-REALITY_PUB=""; REALITY_SHORT=""; REALITY_SNI="www.microsoft.com"
+SERVER_ADDR=""; MESH_IP=""; TOKEN=""; NAME=""; PUB_ADDR="";
+VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID=""; REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bundle-hostfile) HOSTFILE="$2"; shift 2;;
-    --uuid) UUID="$2"; shift 2;;
     --server-addr) SERVER_ADDR="$2"; shift 2;;
     --mesh-ip) MESH_IP="$2"; shift 2;;
-    --reality-public-key) REALITY_PUB="$2"; shift 2;;
-    --reality-short-id) REALITY_SHORT="$2"; shift 2;;
-    --reality-server-name) REALITY_SNI="$2"; shift 2;;
+    --token) TOKEN="$2"; shift 2;;
+    --name) NAME="$2"; shift 2;;
+    --pub-addr) PUB_ADDR="$2"; shift 2;;
     --vless-port) VLESS_PORT="$2"; shift 2;;
     --tinc-port) TINC_PORT="$2"; shift 2;;
-    --forward-port) FW_PORT="$2"; shift 2;;
+    --fw-base) FW_BASE="$2"; shift 2;;
     --mtu) MTU="$2"; shift 2;;
+    --mesh-uuid) MESH_UUID="$2"; shift 2;;
+    --registry-port) REG_PORT="$2"; shift 2;;
+    --reality-dest) REALITY_DEST="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
 done
-[[ -n "$HOSTFILE" && -n "$UUID" && -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$REALITY_PUB" && -n "$REALITY_SHORT" ]] || { usage; exit 1; }
 
+[[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
 need_root
+
 apt-get update -qq
-apt-get install -yq tinc curl jq >/dev/null
+apt-get install -yq tinc curl jq python3 python3-cryptography >/dev/null
 command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
 
+NAME=${NAME:-$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')}
+PUB_ADDR=${PUB_ADDR:-$(hostname -I | awk '{print $1}')}
+DEST_HOST=${REALITY_DEST%%:*}
+
+# Reality keys for this node
+SELF_JSON=/etc/vless-mesh/self.json
+if [[ -f "$SELF_JSON" ]]; then
+  REALITY_PRIV=$(jq -r '.reality_priv' "$SELF_JSON")
+  REALITY_PUB=$(jq -r '.reality_pub' "$SELF_JSON")
+  SHORT_ID=$(jq -r '.short_id' "$SELF_JSON")
+fi
+
+if [[ -z "${REALITY_PRIV:-}" || -z "${REALITY_PUB:-}" || -z "${SHORT_ID:-}" ]]; then
+  REALITY_KEYPAIR=$(xray x25519 || true)
+  REALITY_PRIV=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Private key|PrivateKey/{print $3}')
+  REALITY_PUB=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Public key|PublicKey/{print $3}')
+  if [[ -z "$REALITY_PRIV" || -z "$REALITY_PUB" ]]; then
+    PY_KEYS=$(python3 - <<'PY'
+import base64
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+priv = X25519PrivateKey.generate()
+pub = priv.public_key()
+enc = lambda b: base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+print(enc(priv.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption()
+)))
+print(enc(pub.public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)))
+PY
+    )
+    REALITY_PRIV=$(printf "%s" "$PY_KEYS" | sed -n '1p')
+    REALITY_PUB=$(printf "%s" "$PY_KEYS" | sed -n '2p')
+  fi
+  SHORT_ID=$(openssl rand -hex 4)
+fi
+
 BASE=/etc/tinc/mesh
-rm -rf "$BASE"
 mkdir -p "$BASE/hosts"
 
-# Re-write server host file to point to local dokodemo port (so tinc talks to xray, not directly)
-cat "$HOSTFILE" | \
-  awk -v fw="$FW_PORT" 'BEGIN{addr=0;port=0} /^Address/{addr=1;next} /^Port/{port=1;next} {print} END{print "Address = 127.0.0.1"; print "Port = "fw}' >"$BASE/hosts/server"
-
 cat >"$BASE/tinc.conf" <<EOF
-Name = $(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
+Name = $NAME
 Interface = mesh0
 Mode = switch
 Device = /dev/net/tun
 Port = $TINC_PORT
 TCPOnly = yes
-ConnectTo = server
 EOF
 
 cat >"$BASE/tinc-up" <<EOF
@@ -82,62 +125,201 @@ ip link set \$IF down || true
 EOF
 chmod +x "$BASE/tinc-up" "$BASE/tinc-down"
 
-rm -f "$BASE/rsa_key.priv"
-tincd -n mesh -K4096 <<EOF
+if [[ ! -f "$BASE/rsa_key.priv" ]]; then
+  tincd -n mesh -K4096 <<EOF
 y
 EOF
-SELF=$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
-PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/$SELF")
-cat >"$BASE/hosts/$SELF" <<EOF
-Subnet = $MESH_IP/32
-EOF
-echo "$PUBK" >>"$BASE/hosts/$SELF"
+fi
 
-cat >/usr/local/etc/xray/config.json <<EOF
+SELF_HOST="$BASE/hosts/$NAME"
+PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/$NAME" 2>/dev/null)
+if [[ -z "$PUBK" ]]; then
+  PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/$NAME")
+fi
+cat >"$SELF_HOST" <<EOF
+Subnet = $MESH_IP/32
+$PUBK
+EOF
+
+HOST_B64=$(base64 -w0 "$SELF_HOST")
+
+# fetch peers to get mesh uuid (if present)
+PEERS_URL="http://$SERVER_ADDR:$REG_PORT/peers"
+REG_URL="http://$SERVER_ADDR:$REG_PORT/register"
+TMP_JSON=$(mktemp)
+if curl -fsS -H "X-Mesh-Token: $TOKEN" "$PEERS_URL" -o "$TMP_JSON"; then
+  EXIST_UUID=$(jq -r '.uuid // empty' "$TMP_JSON")
+  if [[ -n "$EXIST_UUID" ]]; then MESH_UUID=${MESH_UUID:-$EXIST_UUID}; fi
+fi
+[[ -n "$MESH_UUID" ]] || MESH_UUID=$(uuidgen)
+
+# register self
+cat >"$TMP_JSON" <<EOF
 {
-  "log":{"loglevel":"warning"},
-  "inbounds":[
-    {
-      "tag":"tinc-in",
-      "listen":"127.0.0.1",
-      "port":$FW_PORT,
-      "protocol":"dokodemo-door",
-      "settings":{"network":"tcp"}
-    }
-  ],
-  "outbounds":[
-    {
-      "tag":"vless-out",
-      "protocol":"vless",
-      "settings":{
-        "vnext":[{
-          "address":"$SERVER_ADDR",
-          "port":$VLESS_PORT,
-          "users":[{"id":"$UUID","encryption":"none"}]
-        }]
-      },
-      "streamSettings":{
-        "network":"tcp",
-        "security":"reality",
-        "realitySettings":{
-          "publicKey":"$REALITY_PUB",
-          "shortId":"$REALITY_SHORT",
-          "serverName":"$REALITY_SNI",
-          "fingerprint":"chrome"
-        }
-      }
-    }
-  ],
-  "routing":{"rules":[{"type":"field","inboundTag":["tinc-in"],"outboundTag":"vless-out"}]}
+  "name":"$NAME",
+  "mesh_ip":"$MESH_IP",
+  "pub_addr":"$PUB_ADDR",
+  "vless_port":$VLESS_PORT,
+  "reality_pub":"$REALITY_PUB",
+  "short_id":"$SHORT_ID",
+  "sni":"$DEST_HOST",
+  "tinc_port":$TINC_PORT,
+  "fw_base":$FW_BASE,
+  "uuid":"$MESH_UUID",
+  "host_b64":"$HOST_B64"
+}
+EOF
+curl -fsS -H "X-Mesh-Token: $TOKEN" -H 'Content-Type: application/json' -X POST -d @"$TMP_JSON" "$REG_URL" -o "$TMP_JSON"
+
+# fetch updated peers
+curl -fsS -H "X-Mesh-Token: $TOKEN" "$PEERS_URL" -o "$TMP_JSON"
+PEERS_JSON="/etc/vless-mesh/peers.json"
+mkdir -p /etc/vless-mesh
+cp "$TMP_JSON" "$PEERS_JSON"
+
+# persist self info for stable keys on rerun
+cat >"$SELF_JSON" <<EOF
+{
+  "name":"$NAME",
+  "mesh_ip":"$MESH_IP",
+  "pub_addr":"$PUB_ADDR",
+  "reality_priv":"$REALITY_PRIV",
+  "reality_pub":"$REALITY_PUB",
+  "short_id":"$SHORT_ID"
 }
 EOF
 
+# build configs via python
+python3 - "$NAME" "$MESH_UUID" "$REALITY_PRIV" "$REALITY_PUB" "$SHORT_ID" "$DEST_HOST" "$VLESS_PORT" "$TINC_PORT" "$FW_BASE" "$BASE" "$PEERS_JSON" <<'PY'
+import sys, json, base64, os
+name, mesh_uuid, r_priv, r_pub, short_id, dest_host, vless_port, tinc_port, fw_base, base_dir, peers_path = sys.argv[1:12]
+vless_port=int(vless_port); tinc_port=int(tinc_port); fw_base=int(fw_base)
+hosts_dir=os.path.join(base_dir,'hosts')
+with open(peers_path) as f:
+    data=json.load(f)
+peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
+
+# Build xray config
+inbounds=[{
+    "tag":"vless-in",
+    "listen":"0.0.0.0",
+    "port":vless_port,
+    "protocol":"vless",
+    "settings":{
+        "clients":[{"id":mesh_uuid,"level":0}],
+        "decryption":"none"
+    },
+    "streamSettings":{
+        "network":"tcp",
+        "security":"reality",
+        "realitySettings":{
+            "show":False,
+            "dest":f"{dest_host}:443" if ':' not in dest_host else dest_host,
+            "serverNames":[dest_host],
+            "privateKey":r_priv,
+            "shortIds":[short_id],
+            "fingerprint":"chrome"
+        }
+    }
+}]
+
+outbounds=[
+    {"tag":"direct","protocol":"freedom"},
+    {"tag":"to-tinc","protocol":"freedom","settings":{"redirect":f"127.0.0.1:{tinc_port}"}}
+]
+routes=[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]
+
+idx=0
+for p in peers:
+    if p['name']==name:
+        continue
+    port = fw_base + idx
+    idx += 1
+    # inbound per peer
+    inbounds.append({
+        "tag":f"in-{p['name']}",
+        "listen":"127.0.0.1",
+        "port":port,
+        "protocol":"dokodemo-door",
+        "settings":{"network":"tcp"}
+    })
+    # outbound to peer
+    outbounds.append({
+        "tag":f"out-{p['name']}",
+        "protocol":"vless",
+        "settings":{
+            "vnext":[{
+                "address":p['pub_addr'],
+                "port":int(p['vless_port']),
+                "users":[{"id":mesh_uuid,"encryption":"none"}]
+            }]
+        },
+        "streamSettings":{
+            "network":"tcp",
+            "security":"reality",
+            "realitySettings":{
+                "publicKey":p['reality_pub'],
+                "shortId":p['short_id'],
+                "serverName":p.get('sni',dest_host),
+                "fingerprint":"chrome"
+            }
+        }
+    })
+    routes.append({
+        "type":"field",
+        "inboundTag":[f"in-{p['name']}"],
+        "outboundTag":f"out-{p['name']}"
+    })
+
+# write xray config
+cfg={"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}
+os.makedirs('/usr/local/etc/xray', exist_ok=True)
+with open('/usr/local/etc/xray/config.json','w') as f:
+    json.dump(cfg,f,indent=2)
+
+# write hosts and tinc connect list
+connect_lines=[]
+idx=0
+for p in peers:
+    if p['name']==name:
+        continue
+    port = fw_base + idx
+    idx += 1
+    raw = base64.b64decode(p['host_b64'])
+    # extract RSA block
+    text = raw.decode(errors='ignore')
+    rsa_lines=[]; grab=False
+    for line in text.splitlines():
+        if line.startswith('-----BEGIN RSA PUBLIC KEY-----'):
+            grab=True
+        if grab:
+            rsa_lines.append(line)
+        if line.startswith('-----END RSA PUBLIC KEY-----'):
+            break
+    host_content = f"Subnet = {p['mesh_ip']}/32\nAddress = 127.0.0.1\nPort = {port}\n" + "\n".join(rsa_lines) + "\n"
+    with open(os.path.join(hosts_dir, p['name']), 'w') as hf:
+        hf.write(host_content)
+    connect_lines.append(f"ConnectTo = {p['name']}")
+
+# append ConnectTo lines to tinc.conf
+conf_path=os.path.join(base_dir,'tinc.conf')
+with open(conf_path,'a') as cf:
+    for line in connect_lines:
+        cf.write(line+'\n')
+
+PY
+
 echo mesh >/etc/tinc/nets.boot
 systemctl enable --now xray
+systemctl restart xray
 systemctl enable --now tinc@mesh
+systemctl restart tinc@mesh
 
 cat <<EOF
-Client ready. Host files in $BASE/hosts
+Client ready.
+  Name: $NAME
   Mesh IP: $MESH_IP
-  Server: $SERVER_ADDR:$VLESS_PORT UUID=$UUID
+  Mesh UUID: $MESH_UUID
+  Registry: http://$SERVER_ADDR:$REG_PORT (token required)
+  Peers stored in /etc/vless-mesh/peers.json
 EOF
