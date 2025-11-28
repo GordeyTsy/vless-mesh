@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # VLESS Reality + tinc mesh client
-# - Registers in mesh registry
-# - Builds per-peer VLESS outbounds and tinc hosts
-# - dial-only mode for NAT: outbound-only, picks best peers by iperf3
-# - mesh-refresh timer keeps peers/config in sync
+# - Registry-based peer distribution
+# - dial-only mode for NAT: outbound only, auto-picks best peers via iperf3
+# - LAN-aware: peers in same private subnet use direct tinc TCP (no VLESS)
+# - mesh-refresh timer re-runs this script with --refresh-only
 
 usage(){ cat <<'H'
 setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
@@ -13,7 +13,7 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --mesh-ip IP           Mesh /24 IP of this node (required)
   --token TOKEN          Registry token (required)
   --name NAME            tinc node name (default hostname)
-  --pub-addr ADDR        Public/DNS used by peers (default first IP)
+  --pub-addr ADDR        Public/DNS peers use to reach this node (default first IP)
   --vless-port PORT      VLESS listen (default 443)
   --tinc-port PORT       tinc local listen (default 6060)
   --fw-base PORT         Base dokodemo port per peer (default 7000)
@@ -21,7 +21,7 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --mesh-uuid UUID       Override mesh UUID
   --registry-port PORT   Registry HTTP port (default 9000)
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
-  --dial-only            Only outbound VLESS (for NAT); no inbound accept
+  --dial-only            Only outbound VLESS (for NAT); do not accept inbound
   --top-peers N          For dial-only: keep top N peers by iperf3 (default 2)
   --refresh-only         Only refresh configs (use saved config)
   -h                     Help
@@ -223,57 +223,76 @@ cat >"$CONFIG_JSON" <<EOF
 }
 EOF
 
-# build configs from peers json
+# helper to build configs from peers json
 build_from_peers() {
   local peers_path="$1"
   NAME="$NAME" MESH_UUID="$MESH_UUID" REALITY_PRIV="$REALITY_PRIV" REALITY_PUB="$REALITY_PUB" SHORT_ID="$SHORT_ID" DEST_HOST="$DEST_HOST" \
-  VLESS_PORT="$VLESS_PORT" TINC_PORT="$TINC_PORT" FW_BASE="$FW_BASE" BASE="$BASE" \
+  VLESS_PORT="$VLESS_PORT" TINC_PORT="$TINC_PORT" FW_BASE="$FW_BASE" BASE="$BASE" SELF_PUB="$PUB_ADDR" \
   python3 - "$peers_path" <<'PY'
-import sys, json, base64, os
+import sys, json, base64, os, ipaddress
 peers_path=sys.argv[1]
-name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); base_dir=os.environ['BASE']
+name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); base_dir=os.environ['BASE']; self_pub=os.environ['SELF_PUB']
 hosts_dir=os.path.join(base_dir,'hosts')
 with open(peers_path) as f: data=json.load(f)
 peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
+
+local_net=None
+try:
+    ip=ipaddress.ip_address(self_pub)
+    if ip.is_private:
+        local_net=ipaddress.ip_network(self_pub+'/24', strict=False)
+except Exception:
+    pass
 
 inbounds=[{"tag":"vless-in","listen":"0.0.0.0","port":vless_port,"protocol":"vless","settings":{"clients":[{"id":mesh_uuid,"level":0}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":False,"dest":dest_host if ':' in dest_host else f"{dest_host}:443","serverNames":[dest_host],"privateKey":r_priv,"shortIds":[short_id],"fingerprint":"chrome"}}}]
 
 outbounds=[{"tag":"direct","protocol":"freedom"},{"tag":"to-tinc","protocol":"freedom","settings":{"redirect":f"127.0.0.1:{tinc_port}"}}]
 routes=[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]
 
-idx=0
+connect_lines=[]; idx_vless=0
 for p in peers:
     if p['name']==name:
         continue
     if not p.get('accept', True):
         continue
-    port=fw_base+idx; idx+=1
-    inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
-    outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":p['pub_addr'],"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
+    peer_pub=p['pub_addr']
+    use_direct=False
+    if local_net:
+        try:
+            pip=ipaddress.ip_address(peer_pub)
+            if pip.is_private and pip in local_net:
+                use_direct=True
+        except Exception:
+            pass
+
+    if use_direct:
+        raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
+        rsa_lines=[]; grab=False
+        for line in text.splitlines():
+            if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
+            if grab: rsa_lines.append(line)
+            if line.startswith('-----END RSA PUBLIC KEY-----'): break
+        host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = {peer_pub}\nPort = {p['tinc_port']}\n"+"\n".join(rsa_lines)+"\n"
+        os.makedirs(hosts_dir, exist_ok=True)
+        open(os.path.join(hosts_dir,p['name']),'w').write(host_content)
+        connect_lines.append(f"ConnectTo = {p['name']}")
+    else:
+        port=fw_base+idx_vless; idx_vless+=1
+        inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
+        outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":peer_pub,"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
     routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"})
+        raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
+        rsa_lines=[]; grab=False
+        for line in text.splitlines():
+            if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
+            if grab: rsa_lines.append(line)
+            if line.startswith('-----END RSA PUBLIC KEY-----'): break
+        host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = 127.0.0.1\nPort = {port}\n"+"\n".join(rsa_lines)+"\n"
+        os.makedirs(hosts_dir, exist_ok=True)
+        open(os.path.join(hosts_dir,p['name']),'w').write(host_content)
+        connect_lines.append(f"ConnectTo = {p['name']}" )
 
-cfg={"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}
-os.makedirs('/usr/local/etc/xray', exist_ok=True)
-with open('/usr/local/etc/xray/config.json','w') as f: json.dump(cfg,f,indent=2)
-
-connect_lines=[]; idx=0
-for p in peers:
-    if p['name']==name:
-        continue
-    if not p.get('accept', True):
-        continue
-    port=fw_base+idx; idx+=1
-    raw=base64.b64decode(p['host_b64'])
-    text=raw.decode(errors='ignore')
-    rsa_lines=[]; grab=False
-    for line in text.splitlines():
-        if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
-        if grab: rsa_lines.append(line)
-        if line.startswith('-----END RSA PUBLIC KEY-----'): break
-    host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = 127.0.0.1\nPort = {port}\n"+"\n".join(rsa_lines)+"\n"
-    os.makedirs(hosts_dir, exist_ok=True)
-    with open(os.path.join(hosts_dir,p['name']),'w') as hf: hf.write(host_content)
-    connect_lines.append(f"ConnectTo = {p['name']}")
+json.dump({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}, open('/usr/local/etc/xray/config.json','w'), indent=2)
 
 conf_path=os.path.join(base_dir,'tinc.conf')
 with open(conf_path,'r') as cf: lines=[l for l in cf if not l.startswith('ConnectTo = ')]
@@ -297,7 +316,8 @@ results=[]
 for p in data.get('peers',[]):
     if not p.get('accept', True):
         continue
-    target=p['mesh_ip']; bps=0
+    target=p['pub_addr']
+    bps=0
     try:
         out=subprocess.check_output(['iperf3','-c',target,'-p','5201','-t','2','-J'], stderr=subprocess.DEVNULL, timeout=8)
         j=json.loads(out); bps=j['end']['sum_received']['bits_per_second']
@@ -312,7 +332,6 @@ PY
   PEERS_FOR_BUILD=$BEST
 fi
 
-export NAME MESH_UUID REALITY_PRIV REALITY_PUB SHORT_ID DEST_HOST VLESS_PORT TINC_PORT FW_BASE BASE
 build_from_peers "$PEERS_FOR_BUILD"
 
 echo mesh >/etc/tinc/nets.boot
@@ -340,132 +359,15 @@ EOF
   systemctl enable --now iperf3-mesh.service
 fi
 
-# mesh-refresh script and timer
+# mesh-refresh calls this script with --refresh-only
 cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
 #!/usr/bin/env bash
 set -euo pipefail
-CFG=/etc/vless-mesh/config.json
-SELF=/etc/vless-mesh/self.json
-[[ -f $CFG && -f $SELF ]] || exit 0
-server=$(jq -r '.server_addr' $CFG)
-token=$(jq -r '.token' $CFG)
-reg_port=$(jq -r '.reg_port' $CFG)
-mesh_ip=$(jq -r '.mesh_ip' $CFG)
-pub_addr=$(jq -r '.pub_addr' $CFG)
-dest=$(jq -r '.reality_dest' $CFG)
-mesh_uuid=$(jq -r '.mesh_uuid' $CFG)
-vless_port=$(jq -r '.vless_port' $CFG)
-tinc_port=$(jq -r '.tinc_port' $CFG)
-fw_base=$(jq -r '.fw_base' $CFG)
-dial_only=$(jq -r '.dial_only' $CFG)
-top_peers=$(jq -r '.top_peers' $CFG)
-name=$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')
-DEST_HOST=${dest%%:*}
-
-pub_key=$(jq -r '.reality_pub' $SELF)
-short_id=$(jq -r '.short_id' $SELF)
-BASE=/etc/tinc/mesh
-HOSTS=$BASE/hosts
-SELF_HOST=$HOSTS/$name
-HOST_B64=$(base64 -w0 "$SELF_HOST")
-PEERS_URL="http://$server:$reg_port/peers"
-REG_URL="http://$server:$reg_port/register"
-TMP=$(mktemp)
-cat >$TMP <<EOF
-{
-  "name":"$name",
-  "mesh_ip":"$mesh_ip",
-  "pub_addr":"$pub_addr",
-  "vless_port":$vless_port,
-  "reality_pub":"$pub_key",
-  "short_id":"$short_id",
-  "sni":"$DEST_HOST",
-  "tinc_port":$tinc_port,
-  "fw_base":$fw_base,
-  "accept":$( [ $dial_only -eq 1 ] && echo false || echo true ),
-  "uuid":"$mesh_uuid",
-  "host_b64":"$HOST_B64"
-}
-EOF
-curl -fsS -H "X-Mesh-Token: $token" -H 'Content-Type: application/json' -X POST -d @$TMP "$REG_URL" -o $TMP
-curl -fsS -H "X-Mesh-Token: $token" "$PEERS_URL" -o $TMP
-cp $TMP /etc/vless-mesh/peers.json
-PEERS_FOR_BUILD=/etc/vless-mesh/peers.json
-if [ $dial_only -eq 1 ]; then
-  BEST=$(mktemp)
-  TOP=$top_peers
-  python3 - <<'PY'
-import json, subprocess, tempfile, os
-peers_path='/etc/vless-mesh/peers.json'
-TOP=int(os.environ.get('TOP','2'))
-with open(peers_path) as f: data=json.load(f)
-results=[]
-for p in data.get('peers',[]):
-    if not p.get('accept', True):
-        continue
-    target=p['mesh_ip']; bps=0
-    try:
-        out=subprocess.check_output(['iperf3','-c',target,'-p','5201','-t','2','-J'], stderr=subprocess.DEVNULL, timeout=8)
-        j=json.loads(out); bps=j['end']['sum_received']['bits_per_second']
-    except Exception:
-        bps=0
-    results.append((bps,p))
-results=sorted(results,key=lambda x:x[0],reverse=True)
-chosen=[r[1] for r in results[:TOP]]
-fd=tempfile.NamedTemporaryFile(delete=False, mode='w'); json.dump({'peers':chosen}, fd); fd.close(); print(fd.name)
-PY
-  PEERS_FOR_BUILD=$BEST
-fi
-export NAME MESH_UUID REALITY_PRIV=$(jq -r '.reality_priv' $SELF) REALITY_PUB=$(jq -r '.reality_pub' $SELF) SHORT_ID=$(jq -r '.short_id' $SELF) DEST_HOST VLESS_PORT TINC_PORT FW_BASE BASE
-python3 - <<'PY'
-import os, json, base64
-peers_path=os.environ['PEERS_FOR_BUILD']
-name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); base_dir=os.environ['BASE']
-hosts_dir=os.path.join(base_dir,'hosts')
-with open(peers_path) as f: data=json.load(f)
-peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
-# xray
-inbounds=[{"tag":"vless-in","listen":"0.0.0.0","port":vless_port,"protocol":"vless","settings":{"clients":[{"id":mesh_uuid,"level":0}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":False,"dest":dest_host if ':' in dest_host else f"{dest_host}:443","serverNames":[dest_host],"privateKey":r_priv,"shortIds":[short_id],"fingerprint":"chrome"}}}]
-outbounds=[{"tag":"direct","protocol":"freedom"},{"tag":"to-tinc","protocol":"freedom","settings":{"redirect":f"127.0.0.1:{tinc_port}"}}]
-routes=[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]
-idx=0
-for p in peers:
-    if p['name']==name or not p.get('accept', True):
-        continue
-    port=fw_base+idx; idx+=1
-    inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
-    outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":p['pub_addr'],"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
-    routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"})
-json.dump({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}, open('/usr/local/etc/xray/config.json','w'), indent=2)
-# tinc hosts
-connect_lines=[]; idx=0
-for p in peers:
-    if p['name']==name or not p.get('accept', True):
-        continue
-    port=fw_base+idx; idx+=1
-    raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
-    rsa_lines=[]; grab=False
-    for line in text.splitlines():
-        if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
-        if grab: rsa_lines.append(line)
-        if line.startswith('-----END RSA PUBLIC KEY-----'): break
-    host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = 127.0.0.1\nPort = {port}\n"+"\n".join(rsa_lines)+"\n"
-    os.makedirs(hosts_dir, exist_ok=True)
-    open(os.path.join(hosts_dir,p['name']),'w').write(host_content)
-    connect_lines.append(f"ConnectTo = {p['name']}" )
-conf_path=os.path.join(base_dir,'tinc.conf')
-with open(conf_path,'r') as cf: lines=[l for l in cf if not l.startswith('ConnectTo = ')]
-with open(conf_path,'w') as cf:
-    cf.writelines(lines)
-    for line in connect_lines:
-        cf.write(line+'\n')
-PY
-systemctl restart xray
-systemctl restart tinc@mesh
+/usr/local/bin/setup-client --refresh-only
 REF
 chmod +x /usr/local/sbin/mesh-refresh.sh
 
-cat >/etc/systemd/system/mesh-refresh.service <<'EOF'
+cat >/etc/systemd/system/mesh-refresh.service <<EOF
 [Unit]
 Description=Refresh VLESS mesh peers
 After=network.target
@@ -478,7 +380,7 @@ ExecStart=/usr/local/sbin/mesh-refresh.sh
 WantedBy=multi-user.target
 EOF
 
-cat >/etc/systemd/system/mesh-refresh.timer <<'EOF'
+cat >/etc/systemd/system/mesh-refresh.timer <<EOF
 [Unit]
 Description=Periodic VLESS mesh refresh
 
