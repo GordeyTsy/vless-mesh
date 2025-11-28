@@ -46,7 +46,7 @@ REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
 
 need_root
 apt-get update -qq
-apt-get install -yq tinc curl jq python3-cryptography python3 >/dev/null
+apt-get install -yq tinc curl jq python3-cryptography python3 iperf3 >/dev/null
 command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
 
 # Reality keypair (X25519) for server; shortId 8 hex chars
@@ -167,6 +167,23 @@ EOF
 echo mesh >/etc/tinc/nets.boot
 systemctl enable --now tinc@mesh
 systemctl enable --now xray
+
+# iperf3 server for throughput probing (P2P selection)
+cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
+[Unit]
+Description=iperf3 server for mesh
+After=network.target
+
+[Service]
+User=nobody
+ExecStart=/usr/bin/iperf3 -s -p 5201
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now iperf3-mesh.service
 
 # Mesh registry data
 mkdir -p /etc/vless-mesh
