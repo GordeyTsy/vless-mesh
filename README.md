@@ -111,3 +111,18 @@ Run `setup-client` once on the new node with its mesh IP, pub-addr, token. Exist
 - Reality provides TLS camouflage; each node has its own keypair/shortId; mesh UUID is shared.
 - Registry protected by token; keep it secret.
 - tinc encryption remains enabled (double encryption over Reality for non-LAN paths).
+
+## Backend API (Django)
+- Purpose: serve mesh status, stats, and topology to the neon UI (`web/index.html`).
+- Run locally:
+  ```bash
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+  .venv/bin/python backend/manage.py migrate   # first run; uses SQLite
+  .venv/bin/python backend/manage.py runserver 0.0.0.0:8001
+  ```
+- Endpoints (GET):
+  - `/api/status` — mesh health, registry/reality/service flags.
+  - `/api/stats` — peers, iperf, RTT, MTU.
+  - `/api/nodes` — node coordinates + links for the canvas.
+- CORS is permissive (`*`) so the static UI (served from file:// or another port) can call the API. Set `API_BASE` in `web/main.js` if you host elsewhere.
