@@ -1,115 +1,113 @@
 # VLESS Mesh (tinc over Reality)
 
-A reproducible L2 mesh VPN where **tinc** carries Ethernet frames and the transport is **VLESS + Reality** (Xray). All nodes can talk **peer‑to‑peer**; if direct P2P is impossible, traffic can still relay via any reachable peer.
+A reproducible L2 mesh where **tinc** carries Ethernet frames and the transport is **VLESS + Reality** (Xray). Supports P2P between all nodes, NAT-friendly dial-only clients, auto peer selection by iperf3, and LAN-aware direct tinc paths.
 
-Tested with Ubuntu 24.04 LXD containers, but the scripts are distro‑agnostic for Debian/Ubuntu–like systems.
+Tested on Ubuntu 24.04 (LXD), but scripts target Debian/Ubuntu-like systems.
 
-## Components
-- **tinc**: L2 switch mode, static /24 addressing, automatic P2P links.
-- **xray-core**: VLESS over TCP + Reality; each node has its own Reality keypair/shortId; all nodes share one mesh UUID.
-- **Mesh registry** (on server): simple HTTP API to distribute host files and Reality info; authenticated by a shared token.
-- **mesh-refresh** (on clients): systemd timer that re-syncs peers every 2 minutes.
+## What you get
+- L2 mesh (switch mode) with static /24 addressing.
+- Encrypted transport: VLESS over TCP + Reality on every node.
+- NAT clients: dial-only mode (outbound only) with automatic best-peer choice via iperf3.
+- LAN-aware: peers in the same private /24 connect directly via tinc (no VLESS overhead).
+- Mesh registry on server to distribute host files & Reality params (token-protected).
+- Auto-refresh timer on clients.
 
-## What the scripts install
-- Packages: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `xray-core` (via official installer if missing).
-- Services: `tinc@mesh`, `xray.service`, `mesh-registry.service` (server), `mesh-refresh.timer` (clients).
+## Dependencies installed by scripts
+- Packages: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `iperf3`, `xray-core` (if missing, installed via official script).
+- Services: `tinc@mesh`, `xray.service`, `mesh-registry.service` (server), `mesh-refresh.timer` (clients), `iperf3-mesh.service` (accepting nodes).
 
-## Network / Ports
-- tinc virtual subnet: `/24` you choose (examples use 10.10.0.0/24).
-- tinc TCP listen: default `6060` (local only; real transport is via xray).
+## Ports & network
+- Virtual subnet: you choose `/24` (example 10.10.0.0/24).
+- tinc TCP listen: default `6060` (local only when VLESS is used).
 - xray VLESS listen: default `443` on every node.
 - Reality dest/SNI: default `www.microsoft.com:443` (change with `--reality-dest`).
 - Registry HTTP: default `9000` on server.
+- iperf3: `5201` TCP (used only for throughput probing).
 
 ## Quick start (clean environment)
-1) **Server** (has reachable IP/DNS):
+1) **Server** (reachable IP/DNS):
 ```bash
 sudo ./setup-server --mesh-ip 10.10.0.1 --pub-addr <SERVER_PUBLIC_IP>
 ```
-Output includes:
-- Mesh UUID
-- Reality public key + shortId
-- Registry token and URL
-- Host file path `/etc/tinc/mesh/hosts/server`
+Output: Mesh UUID, Reality public key/shortId, registry token, host file `/etc/tinc/mesh/hosts/server`.
 
-2) **Each client** (unique mesh IP + its public/DNS addr):
+2) **Clients** (unique mesh IP + public/DNS):
+Standard (accepts inbound):
 ```bash
 sudo ./setup-client \
   --server-addr <SERVER_PUBLIC_IP> \
   --mesh-ip 10.10.0.X \
-  --pub-addr <THIS_PUBLIC_IP_OR_DNS> \
-  --token <TOKEN_FROM_SERVER>
+  --pub-addr <THIS_PUBLIC_OR_DNS> \
+  --token <TOKEN>
 ```
-That single command will:
-- Register the node in the registry
-- Pull all peers and build per-peer VLESS outbounds and tinc host files
-- Start xray, tinc, and the mesh-refresh timer
-
-3) **Verify connectivity**
+NAT dial-only (outbound only) with best-peer selection (top 2):
 ```bash
-ping 10.10.0.1          # from any client to server
-ping 10.10.0.4          # client-to-client (P2P over VLESS)
+sudo ./setup-client \
+  --server-addr <SERVER_PUBLIC_IP> \
+  --mesh-ip 10.10.0.X \
+  --pub-addr <THIS_LAN_IP_OR_PUBLIC> \
+  --token <TOKEN> \
+  --dial-only --top-peers 2
 ```
+Peers in same private /24 automatically use direct tinc TCP (no VLESS) for lower latency.
+
+3) **Verify**
+```bash
+ping 10.10.0.1      # client -> server
+ping 10.10.0.4      # client -> client (p2p)
+```
+`ss -tnp | grep 443` on a client should show direct sockets to peers; for LAN peers you should see tinc TCP to their LAN IP/6060.
 
 ## Flags reference
 ### setup-server
-- `--mesh-ip` (required) Mesh /24 IP of server.
-- `--pub-addr` (required) Public IP/DNS reachable by clients.
-- `--vless-port` (default 443)
-- `--tinc-port` (default 6060)
-- `--mtu` (default 1400)
+- `--mesh-ip` (required) server mesh /24 IP
+- `--pub-addr` (required) public/DNS reachable by clients
+- `--vless-port` (443), `--tinc-port` (6060), `--mtu` (1400)
 - `--reality-dest` (default www.microsoft.com:443)
-- `--mesh-uuid` (optional preset)
-- `--registry-port` (default 9000)
-- `--registry-token` (optional preset)
+- `--mesh-uuid` (optional), `--registry-port` (9000), `--registry-token` (optional)
 
 ### setup-client
-- `--server-addr` (required) Server public IP/DNS (registry + VLESS peers)
-- `--mesh-ip` (required) Client mesh /24 IP
-- `--token` (required) Registry token from server
-- `--pub-addr` Public/DNS other peers will dial (defaults to first IP of host)
-- `--name` Custom tinc node name (default: hostname)
-- `--vless-port` (default 443)
-- `--tinc-port` (default 6060)
-- `--fw-base` Base dokodemo port (default 7000; per-peer increments)
-- `--mtu` (default 1400)
-- `--mesh-uuid` Override mesh UUID
-- `--registry-port` (default 9000)
-- `--reality-dest` Fake SNI/dest for Reality (default www.microsoft.com:443)
-- `--refresh-only` Skip installs/registration; just re-pull peers and rewrite configs
+- `--server-addr` (required) server public IP/DNS
+- `--mesh-ip` (required) static mesh /24 IP
+- `--token` (required) registry token
+- `--pub-addr` public/DNS for this node (defaults to first IP)
+- `--name` tinc node name (default hostname)
+- `--vless-port` (443), `--tinc-port` (6060), `--fw-base` (7000), `--mtu` (1400)
+- `--mesh-uuid`, `--registry-port`, `--reality-dest`
+- `--dial-only` outbound-only; does not accept inbound VLESS
+- `--top-peers N` keep N best peers by iperf3 (default 2) in dial-only mode
+- `--refresh-only` reuse saved config, re-pull registry, rerun iperf selection
 
-## Files & state
-- `/etc/vless-mesh/token` (server): registry auth token.
-- `/etc/vless-mesh/peers.json`: current peer list (both server and clients).
-- `/etc/vless-mesh/self.json`: client’s own Reality keys and shortId (keeps keys stable on reruns).
-- `/etc/vless-mesh/config.json`: saved client parameters for refresh.
-- `/etc/tinc/mesh/hosts/*`: host files rewritten to point to local dokodemo ports.
-- `/usr/local/etc/xray/config.json`: generated xray config.
+## Files
+- Server token: `/etc/vless-mesh/token`
+- Peers list: `/etc/vless-mesh/peers.json`
+- Client identity: `/etc/vless-mesh/self.json`
+- Saved params: `/etc/vless-mesh/config.json`
+- tinc hosts: `/etc/tinc/mesh/hosts/*`
+- xray config: `/usr/local/etc/xray/config.json`
 
-## Adding a new client later
-Just run `setup-client` once on the new node with its mesh IP and pub addr plus the shared token. Existing nodes will pick it up automatically via their `mesh-refresh` timer (or run `setup-client --refresh-only`).
+## How dial-only selection works
+- After registration, NAT client runs iperf3 to all accepting peers’ public addresses on port 5201.
+- Keeps top N by throughput (`--top-peers`).
+- Builds VLESS+tinc only to those; others are ignored.
+- On LAN (same private /24), connection bypasses VLESS: tinc points directly to peer LAN IP/6060.
 
-## Refreshing peers manually
-On any client:
-```bash
+## Refresh
+```
 sudo ./setup-client --refresh-only
 ```
-Uses saved `/etc/vless-mesh/config.json` and `self.json`; does not reinstall packages.
+Uses saved config/self, re-fetches registry, reruns iperf (for dial-only), rebuilds xray/tinc, restarts services.
+
+## Adding a new client later
+Run `setup-client` once on the new node with its mesh IP, pub-addr, token. Existing nodes will learn it on next refresh (timer every 2 minutes).
 
 ## Troubleshooting
-- **Ping fails / "unknown identity" in tinc logs**: ensure `/etc/tinc/mesh/hosts/` has all peers; run `--refresh-only` or rerun `setup-client` to regenerate host files.
-- **Reality auth failed**: verify server public key/shortId in `/etc/vless-mesh/peers.json` match server output; rerun client with correct `--token` and `--server-addr`.
-- **Ports blocked**: VLESS uses TCP 443 by default—make sure it’s reachable; registry needs TCP 9000.
-- **Re-run after IP change**: run `setup-client` again with updated `--pub-addr` or edit `config.json` then `--refresh-only`.
-
-## Cleanup
-- Stop services and remove configs:
-```bash
-sudo systemctl disable --now xray tinc@mesh mesh-refresh.timer mesh-registry.service 2>/dev/null
-sudo rm -rf /etc/tinc/mesh /etc/vless-mesh /usr/local/etc/xray
-```
+- No ping / “unknown identity”: run `--refresh-only` to regenerate hosts; ensure token/mesh UUID correct.
+- Reality auth failed: confirm server public key/shortId in `/etc/vless-mesh/peers.json`.
+- Ports: VLESS 443, registry 9000, iperf3 5201; allow outbound 443 from NAT nodes.
+- Changed public/LAN IP: rerun `setup-client` with updated `--pub-addr` or edit config.json then `--refresh-only`.
 
 ## Security notes
-- Reality provides TLS camouflage; each node has its own keypair/shortId.
-- Registry is protected only by the shared token—treat it as a secret.
-- tinc encryption remains enabled (double encryption over Reality); you can tune tinc if desired.
+- Reality provides TLS camouflage; each node has its own keypair/shortId; mesh UUID is shared.
+- Registry protected by token; keep it secret.
+- tinc encryption remains enabled (double encryption over Reality for non-LAN paths).

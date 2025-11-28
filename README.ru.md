@@ -1,106 +1,93 @@
 # VLESS Mesh (tinc поверх Reality)
 
-Повторяемая L2 mesh‑сеть: **tinc** передаёт кадры Ethernet, а транспорт — **VLESS + Reality** (Xray). Узлы общаются напрямую (peer‑to‑peer); если прямой путь недоступен, трафик может идти через любой доступный пир.
+L2 mesh: **tinc** передаёт кадры Ethernet, транспорт — **VLESS + Reality** (Xray). Поддерживает P2P, NAT-клиентов в режиме dial-only с автоподбором пиров через iperf3, а для узлов в одной LAN строит прямой tinc без VLESS.
 
-Протестировано в LXD (Ubuntu 24.04), но скрипты подходят для Debian/Ubuntu‑подобных систем.
+Проверено на Ubuntu 24.04 (LXD), но рассчитано на Debian/Ubuntu-подобные системы.
 
-## Компоненты
-- **tinc**: режим switch, статическая /24, автоматические P2P‑линки.
-- **xray-core**: VLESS по TCP + Reality; у каждого узла свой Reality‑ключ и shortId; общий mesh UUID.
-- **Реестр** (на сервере): простой HTTP API для раздачи host‑файлов и Reality‑данных; доступ по токену.
-- **mesh-refresh** (на клиентах): systemd‑таймер, раз в 2 минуты подтягивает peers и перезаписывает конфиги.
+## Возможности
+- L2 (switch), статическая /24.
+- Шифрование: VLESS TCP + Reality на каждом узле.
+- NAT-friendly: `--dial-only` + выбор лучших пиров по iperf3.
+- LAN-aware: если пир в той же приватной /24, tinc подключается напрямую (нет VLESS оверхеда).
+- Реестр пиров на сервере (HTTP, токен), авто-refresh на клиентах.
 
 ## Что ставят скрипты
-- Пакеты: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `xray-core` (через официальный инсталлер, если нет).
-- Сервисы: `tinc@mesh`, `xray.service`, `mesh-registry.service` (сервер), `mesh-refresh.timer` (клиенты).
+- Пакеты: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `iperf3`, `xray-core` (если нет — ставится).
+- Сервисы: `tinc@mesh`, `xray.service`, `mesh-registry.service` (сервер), `mesh-refresh.timer` (клиенты), `iperf3-mesh.service` (принимающие).
 
-## Сеть и порты
-- Виртуальная подсеть tinc: `/24` на выбор (пример 10.10.0.0/24).
-- tinc TCP listen: по умолчанию `6060` (локально, трафик уходит через xray).
-- xray VLESS listen: по умолчанию `443` на каждом узле.
-- Reality dest/SNI: по умолчанию `www.microsoft.com:443` (меняется флагом `--reality-dest`).
-- Реестр HTTP: по умолчанию `9000` на сервере.
+## Порты
+- Виртуальная сеть: /24 (пример 10.10.0.0/24).
+- tinc TCP: 6060 (локально при работе через VLESS).
+- VLESS: 443.
+- Reality dest/SNI: www.microsoft.com:443 (по умолчанию).
+- Реестр: 9000.
+- iperf3: 5201 (для теста скорости).
 
-## Быстрый запуск (с нуля)
-1) **Сервер** (имеет доступный IP/DNS):
-```bash
-sudo ./setup-server --mesh-ip 10.10.0.1 --pub-addr <PUBLIC_IP>
+## Быстрый старт
+1) Сервер (есть публичный IP/DNS):
 ```
-В выводе будут: Mesh UUID, Reality public key + shortId, токен реестра, путь к host‑файлу `/etc/tinc/mesh/hosts/server`.
-
-2) **Каждый клиент** (своё mesh‑IP и публичный адрес):
-```bash
-sudo ./setup-client \
-  --server-addr <PUBLIC_IP> \
-  --mesh-ip 10.10.0.X \
-  --pub-addr <THIS_PUBLIC_IP_OR_DNS> \
-  --token <TOKEN_FROM_SERVER>
+sudo ./setup-server --mesh-ip 10.10.0.1 --pub-addr <SERVER_IP>
 ```
-Команда сама зарегистрирует узел, скачает peers, построит per‑peer VLESS и host‑файлы tinc, запустит xray/tinc/mesh-refresh.
+В выводе: Mesh UUID, Reality key/shortId, токен, host-файл.
 
-3) **Проверка**
-```bash
-ping 10.10.0.1      # клиент → сервер
-ping 10.10.0.4      # клиент → клиент (P2P поверх VLESS)
+2) Клиенты:
+Обычный (принимает входящие):
 ```
+sudo ./setup-client --server-addr <SERVER_IP> \
+  --mesh-ip 10.10.0.X --pub-addr <THIS_PUBLIC> \
+  --token <TOKEN>
+```
+NAT dial-only (только исходящие, выбор лучших пиров):
+```
+sudo ./setup-client --server-addr <SERVER_IP> \
+  --mesh-ip 10.10.0.X --pub-addr <THIS_LAN_OR_PUBLIC> \
+  --token <TOKEN> --dial-only --top-peers 2
+```
+Если пир в той же приватной /24, соединение пойдёт напрямую через tinc без VLESS.
+
+3) Проверка
+```
+ping 10.10.0.1
+ping 10.10.0.4
+```
+`ss -tnp | grep 443` покажет VLESS-сокеты; для LAN-пиров будет видно прямое tinc TCP на их LAN-IP:6060.
 
 ## Параметры
 ### setup-server
-- `--mesh-ip` (обязательно) Mesh /24 IP сервера
-- `--pub-addr` (обязательно) Публичный IP/DNS сервера
-- `--vless-port` (443)
-- `--tinc-port` (6060)
-- `--mtu` (1400)
-- `--reality-dest` (www.microsoft.com:443)
-- `--mesh-uuid` (необязательно)
-- `--registry-port` (9000)
-- `--registry-token` (необязательно)
+- `--mesh-ip` (обязательно), `--pub-addr` (обязательно)
+- `--vless-port` 443, `--tinc-port` 6060, `--mtu` 1400
+- `--reality-dest` (SNI), `--mesh-uuid`, `--registry-port` 9000, `--registry-token`
 
 ### setup-client
-- `--server-addr` (обязательно) IP/DNS сервера
-- `--mesh-ip` (обязательно) Статический mesh /24 IP узла
-- `--token` (обязательно) Токен реестра
-- `--pub-addr` Публичный/DNS адрес этого узла (по умолчанию первый IP интерфейса)
-- `--name` Имя узла (tinc), по умолчанию hostname
-- `--vless-port` (443)
-- `--tinc-port` (6060)
-- `--fw-base` Базовый dokodemo‑порт, на каждый пир +1 (7000)
-- `--mtu` (1400)
-- `--mesh-uuid` Задать UUID mesh
-- `--registry-port` (9000)
-- `--reality-dest` SNI/dest для Reality
-- `--refresh-only` Только обновить конфиги из реестра (без установки пакетов и регистрации)
+- `--server-addr`, `--mesh-ip`, `--token` — обязательные
+- `--pub-addr`, `--name`, `--vless-port`, `--tinc-port`, `--fw-base`, `--mtu`
+- `--mesh-uuid`, `--registry-port`, `--reality-dest`
+- `--dial-only` — узел за NAT, только исходящие туннели
+- `--top-peers N` — сколько лучших пиров оставить (iperf3), по умолчанию 2
+- `--refresh-only` — обновить из сохранённого конфига
 
-## Файлы
-- `/etc/vless-mesh/token` (сервер): токен реестра
-- `/etc/vless-mesh/peers.json`: список пиров
-- `/etc/vless-mesh/self.json`: собственные Reality‑ключи узла
-- `/etc/vless-mesh/config.json`: сохранённые параметры клиента (используются при refresh)
-- `/etc/tinc/mesh/hosts/*`: host‑файлы, переписанные на 127.0.0.1:<dokodemo>
-- `/usr/local/etc/xray/config.json`: сгенерированный конфиг xray
+## Внутри
+- Клиент регистрируется в реестре, получает список пиров.
+- dial-only: iperf3 к принимающим, оставляет top N; строит VLESS/tinc только к ним.
+- LAN-aware: если пир в той же приватной /24, tinc подключается напрямую к его `tinc_port`, минуя VLESS.
+- mesh-refresh каждые 2 минуты запускает `setup-client --refresh-only` (с iperf-подбором для dial-only).
 
-## Добавление нового клиента
-Запустите `setup-client` на новом узле с его mesh‑IP, pub‑addr и токеном. Остальные узлы подтянут его автоматически через `mesh-refresh` (или вручную `setup-client --refresh-only`).
-
-## Ручное обновление peers
-```bash
+## Обновление
+```
 sudo ./setup-client --refresh-only
 ```
-Использует сохранённые config/self, не переустанавливает пакеты.
+Использует сохранённые config/self, снова тянет реестр, перегенерирует xray/tinc.
 
-## Типичные проблемы
-- **Unknown identity / ping не идёт**: обновите хосты `--refresh-only` или повторно запустите `setup-client`.
-- **Reality auth failed**: сверить public key/shortId сервера в `/etc/vless-mesh/peers.json`; перезапустить клиент с корректным токеном и адресом.
-- **Блокируются порты**: VLESS слушает TCP 443, реестр — 9000.
-- **Смена публичного IP**: запустить `setup-client` с новым `--pub-addr` или правкой `config.json` + `--refresh-only`.
+## Добавить новый клиент
+Запустите `setup-client` на новом узле с его mesh-IP, pub-addr и токеном. Остальные увидят его при следующем refresh.
 
-## Очистка
-```bash
-sudo systemctl disable --now xray tinc@mesh mesh-refresh.timer mesh-registry.service 2>/dev/null
-sudo rm -rf /etc/tinc/mesh /etc/vless-mesh /usr/local/etc/xray
-```
+## Устранение неполадок
+- Нет ping / unknown identity: `--refresh-only`, проверьте токен/UUID.
+- Reality auth fail: сверить public key/shortId сервера в `/etc/vless-mesh/peers.json`.
+- Порты: VLESS 443, реестр 9000, iperf3 5201; для NAT узлов нужен исходящий 443.
+- Смена pub/LAN IP: перезапустить с новым `--pub-addr` или отредактировать config.json + `--refresh-only`.
 
 ## Безопасность
-- Reality даёт TLS‑маскировку; у каждого узла своя пара ключ/shortId.
-- Реестр защищён только токеном — храните его в секрете.
-- Шифрование tinc не отключено: получается двойное шифрование поверх Reality.
+- Reality: маскировка под TLS, у каждого узла свой key/shortId.
+- Токен реестра хранить в секрете.
+- tinc шифрование не отключено (двойное шифрование поверх Reality для нелокальных путей).
