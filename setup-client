@@ -23,6 +23,7 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --registry-port PORT   Registry HTTP port (default 9000)
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
   --refresh-only         Only refresh configs from registry (no install/register)
+  --dial-only            Do not accept inbound VLESS (behind NAT); only dial out
   -h                     Help
 EOF
 }
@@ -30,7 +31,7 @@ EOF
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 
 SERVER_ADDR=""; MESH_IP=""; TOKEN=""; NAME=""; PUB_ADDR="";
-VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID=""; REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0
+VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID=""; REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0; DIAL_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --registry-port) REG_PORT="$2"; shift 2;;
     --reality-dest) REALITY_DEST="$2"; shift 2;;
     --refresh-only) REFRESH_ONLY=1; shift 1;;
+    --dial-only) DIAL_ONLY=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
@@ -195,6 +197,7 @@ cat >"$TMP_JSON" <<EOF
   "sni":"$DEST_HOST",
   "tinc_port":$TINC_PORT,
   "fw_base":$FW_BASE,
+  "accept":$( [ $DIAL_ONLY -eq 1 ] && echo false || echo true ),
   "uuid":"$MESH_UUID",
   "host_b64":"$HOST_B64"
 }
@@ -450,6 +453,8 @@ idx=0
 for p in peers:
     if p['name']==name:
         continue
+    if not p.get('accept', True):
+        continue
     port=fw_base+idx; idx+=1
     inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
     outbounds.append({
@@ -468,6 +473,8 @@ with open('/usr/local/etc/xray/config.json','w') as f: json.dump(cfg,f,indent=2)
 connect_lines=[]; idx=0
 for p in peers:
     if p['name']==name:
+        continue
+    if not p.get('accept', True):
         continue
     port=fw_base+idx; idx+=1
     raw=base64.b64decode(p['host_b64'])

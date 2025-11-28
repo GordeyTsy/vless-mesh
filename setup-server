@@ -248,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
         except Exception:
             self._json(400,{"error":"bad json"}); return
-        required = ["name","mesh_ip","pub_addr","vless_port","reality_pub","short_id","sni","tinc_port","fw_base","uuid","host_b64"]
+        required = ["name","mesh_ip","pub_addr","vless_port","reality_pub","short_id","sni","tinc_port","fw_base","uuid","host_b64","accept"]
         if any(k not in payload for k in required):
             self._json(400,{"error":"missing fields"}); return
         data = load_peers()
