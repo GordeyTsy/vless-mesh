@@ -12,7 +12,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const statRttEl = document.getElementById('stat-rtt');
   const statMtuEl = document.getElementById('stat-mtu');
   const refreshBtn = document.querySelector('.cta');
-  const API_BASE = window.API_BASE || 'http://127.0.0.1:8001';
+  const defaultApi =
+    window.location.port === '8000'
+      ? 'http://127.0.0.1:8001'
+      : window.location.origin;
+  const API_BASE = window.API_BASE || defaultApi;
 
   // Interactive light spot on liquid cards.
   liquidCards.forEach((card) => {

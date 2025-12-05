@@ -23,16 +23,85 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
   --dial-only            Only outbound VLESS (for NAT); do not accept inbound
   --top-peers N          For dial-only: keep top N peers by iperf3 (default 2)
+  --deploy MODE          host|docker|compose (default host)
   --refresh-only         Only refresh configs (use saved config)
   -h                     Help
 H
 }
 
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
+ensure_docker(){ command -v docker >/dev/null || { echo "docker is required for --deploy docker/compose"; exit 1; }; }
+
+write_docker_context() {
+  local ctx="/etc/vless-mesh/docker-node"
+  mkdir -p "$ctx"
+  if [[ -f "$ctx/Dockerfile" ]]; then
+    return
+  fi
+  cat >"$ctx/Dockerfile" <<'EOF'
+FROM debian:12-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip \
+    && mkdir -p /usr/local/share/xray /usr/local/etc/xray \
+    && curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+    && unzip /tmp/xray.zip -d /tmp/xray \
+    && install -m755 /tmp/xray/xray /usr/local/bin/xray \
+    && install -m644 /tmp/xray/geoip.dat /usr/local/share/xray/geoip.dat \
+    && install -m644 /tmp/xray/geosite.dat /usr/local/share/xray/geosite.dat \
+    && rm -rf /var/lib/apt/lists/* /tmp/xray /tmp/xray.zip
+COPY entry.sh /entry.sh
+RUN chmod +x /entry.sh
+ENTRYPOINT ["/entry.sh"]
+EOF
+  cat >"$ctx/entry.sh" <<'EOF'
+#!/bin/bash
+set -e
+MODE=${MODE:-client}
+ENABLE_IPERF=${ENABLE_IPERF:-0}
+tincd -n mesh -D &
+xray run -c /usr/local/etc/xray/config.json &
+if [ "$ENABLE_IPERF" = "1" ]; then
+  iperf3 -s -p 5201 &
+fi
+wait -n
+EOF
+}
+
+build_image() {
+  ensure_docker
+  write_docker_context
+  docker build -t vless-mesh-node:latest /etc/vless-mesh/docker-node
+}
+
+write_compose_client() {
+  local file="/etc/vless-mesh/docker-compose.client.yml"
+  cat >"$file" <<EOF
+version: "3.9"
+services:
+  mesh-client:
+    image: vless-mesh-node:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /etc/tinc/mesh:/etc/tinc/mesh
+      - /usr/local/etc/xray:/usr/local/etc/xray
+      - /etc/vless-mesh:/etc/vless-mesh
+    environment:
+      - MODE=client
+      - ENABLE_IPERF=$(( DIAL_ONLY == 0 ))
+    restart: unless-stopped
+EOF
+  echo "$file"
+}
 
 SERVER_ADDR=""; MESH_IP=""; TOKEN=""; NAME=""; PUB_ADDR="";
 VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID="";
 REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0; DIAL_ONLY=0; TOP_PEERS=2
+DEPLOY="host"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,11 +119,17 @@ while [[ $# -gt 0 ]]; do
     --reality-dest) REALITY_DEST="$2"; shift 2;;
     --dial-only) DIAL_ONLY=1; shift 1;;
     --top-peers) TOP_PEERS="$2"; shift 2;;
+    --deploy) DEPLOY="$2"; shift 2;;
     --refresh-only) REFRESH_ONLY=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
 done
+
+case "$DEPLOY" in
+  host|docker|compose) ;;
+  *) echo "Unsupported --deploy $DEPLOY (expected host|docker|compose)"; exit 1;;
+esac
 
 need_root
 CONFIG_JSON=/etc/vless-mesh/config.json
@@ -78,9 +153,11 @@ fi
 
 if [[ $REFRESH_ONLY -eq 0 ]]; then
   [[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
-  apt-get update -qq
-  apt-get install -yq tinc curl jq python3 python3-cryptography iperf3 >/dev/null
-  command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+  if [[ "$DEPLOY" == "host" ]]; then
+    apt-get update -qq
+    apt-get install -yq tinc curl jq python3 python3-cryptography iperf3 >/dev/null
+    command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+  fi
 else
   [[ -n "$SERVER_ADDR" ]] || { echo "refresh: server_addr missing"; exit 1; }
 fi
@@ -335,14 +412,16 @@ fi
 build_from_peers "$PEERS_FOR_BUILD"
 
 echo mesh >/etc/tinc/nets.boot
-systemctl enable --now xray
-systemctl restart xray
-systemctl enable --now tinc@mesh
-systemctl restart tinc@mesh
 
-# iperf3 server for accepting nodes
-if [[ $DIAL_ONLY -eq 0 ]]; then
-  cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
+if [[ "$DEPLOY" == "host" ]]; then
+  systemctl enable --now xray
+  systemctl restart xray
+  systemctl enable --now tinc@mesh
+  systemctl restart tinc@mesh
+
+  # iperf3 server for accepting nodes
+  if [[ $DIAL_ONLY -eq 0 ]]; then
+    cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
 [Unit]
 Description=iperf3 server for mesh
 After=network.target
@@ -355,19 +434,19 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now iperf3-mesh.service
-fi
+    systemctl daemon-reload
+    systemctl enable --now iperf3-mesh.service
+  fi
 
-# mesh-refresh calls this script with --refresh-only
-cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
+  # mesh-refresh calls this script with --refresh-only
+  cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
 #!/usr/bin/env bash
 set -euo pipefail
 /usr/local/bin/setup-client --refresh-only
 REF
-chmod +x /usr/local/sbin/mesh-refresh.sh
+  chmod +x /usr/local/sbin/mesh-refresh.sh
 
-cat >/etc/systemd/system/mesh-refresh.service <<EOF
+  cat >/etc/systemd/system/mesh-refresh.service <<EOF
 [Unit]
 Description=Refresh VLESS mesh peers
 After=network.target
@@ -380,7 +459,7 @@ ExecStart=/usr/local/sbin/mesh-refresh.sh
 WantedBy=multi-user.target
 EOF
 
-cat >/etc/systemd/system/mesh-refresh.timer <<EOF
+  cat >/etc/systemd/system/mesh-refresh.timer <<EOF
 [Unit]
 Description=Periodic VLESS mesh refresh
 
@@ -392,9 +471,24 @@ OnUnitActiveSec=120
 WantedBy=timers.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now mesh-refresh.timer
-systemctl start mesh-refresh.service
+  systemctl daemon-reload
+  systemctl enable --now mesh-refresh.timer
+  systemctl start mesh-refresh.service
+else
+  build_image
+  if [[ "$DEPLOY" == "docker" ]]; then
+    docker run -d --name "mesh-client-$NAME" --network host \
+      --cap-add NET_ADMIN --device /dev/net/tun \
+      -e MODE=client -e ENABLE_IPERF=$(( DIAL_ONLY == 0 )) \
+      -v /etc/tinc/mesh:/etc/tinc/mesh \
+      -v /usr/local/etc/xray:/usr/local/etc/xray \
+      -v /etc/vless-mesh:/etc/vless-mesh \
+      vless-mesh-node:latest
+  else
+    compose_file=$(write_compose_client)
+    docker compose -f "$compose_file" up -d
+  fi
+fi
 
 cat <<EOF
 Client ready.
@@ -403,4 +497,5 @@ Client ready.
   Mesh UUID: $MESH_UUID
   Registry: http://$SERVER_ADDR:$REG_PORT (token required)
   Dial-only: $DIAL_ONLY (top peers: $TOP_PEERS)
+  Deploy mode: $DEPLOY
 EOF

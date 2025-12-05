@@ -16,13 +16,233 @@ setup-server --mesh-ip IP --pub-addr ADDR [options]
   --mesh-uuid UUID     Shared mesh UUID (default generate)
   --registry-port PORT Registry HTTP port (default 9000)
   --registry-token TOK Pre-shared token (default generate)
+  --deploy MODE        host|compose|k8s (default host)
+  --image-registry R/  Registry prefix for container image (e.g. registry:443/) for compose/k8s
   -h                   help
 EOF
 }
 
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 
+ensure_docker(){ command -v docker >/dev/null || { echo "docker is required for --deploy compose/k8s"; exit 1; }; }
+ensure_kubectl(){ command -v kubectl >/dev/null || { echo "kubectl is required for --deploy k8s"; exit 1; }; }
+
+write_docker_context() {
+  local ctx="/etc/vless-mesh/docker-node"
+  mkdir -p "$ctx"
+  cat >"$ctx/Dockerfile" <<'EOF'
+FROM debian:12-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip \
+    && mkdir -p /usr/local/share/xray /usr/local/etc/xray \
+    && curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+    && unzip /tmp/xray.zip -d /tmp/xray \
+    && install -m755 /tmp/xray/xray /usr/local/bin/xray \
+    && install -m644 /tmp/xray/geoip.dat /usr/local/share/xray/geoip.dat \
+    && install -m644 /tmp/xray/geosite.dat /usr/local/share/xray/geosite.dat \
+    && rm -rf /var/lib/apt/lists/* /tmp/xray /tmp/xray.zip
+COPY entry.sh /entry.sh
+COPY registry.py /registry.py
+RUN chmod +x /entry.sh
+ENTRYPOINT ["/entry.sh"]
+EOF
+  cat >"$ctx/entry.sh" <<'EOF'
+#!/bin/bash
+set -e
+MODE=${MODE:-server}
+ENABLE_REGISTRY=${ENABLE_REGISTRY:-0}
+ENABLE_IPERF=${ENABLE_IPERF:-1}
+tincd -n mesh -D &
+xray run -c /usr/local/etc/xray/config.json &
+if [ "$ENABLE_REGISTRY" = "1" ]; then
+  python3 /registry.py /etc/vless-mesh/peers.json &
+fi
+if [ "$MODE" = "server" ] && [ "$ENABLE_IPERF" = "1" ]; then
+  iperf3 -s -p 5201 &
+fi
+wait -n
+EOF
+  cat >"$ctx/registry.py" <<'EOF'
+#!/usr/bin/env python3
+import json, base64, os, sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+DATA = Path(sys.argv[1]) if len(sys.argv)>1 else Path('/etc/vless-mesh/peers.json')
+TOKEN_FILE = Path('/etc/vless-mesh/token')
+HOSTS_DIR = Path('/etc/tinc/mesh/hosts')
+
+def load_token():
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except Exception:
+        return ''
+
+def load_peers():
+    if DATA.exists():
+        return json.loads(DATA.read_text())
+    return {"uuid": None, "peers": []}
+
+def save_peers(data):
+    tmp = DATA.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(DATA)
+
+class Handler(BaseHTTPRequestHandler):
+    def _auth(self):
+        token = self.headers.get('X-Mesh-Token','')
+        return token == load_token()
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path != '/peers':
+            self.send_response(404); self.end_headers(); return
+        if not self._auth():
+            self.send_response(401); self.end_headers(); return
+        data = load_peers()
+        self._json(200, data)
+    def do_POST(self):
+        if self.path != '/register':
+            self.send_response(404); self.end_headers(); return
+        if not self._auth():
+            self.send_response(401); self.end_headers(); return
+        length = int(self.headers.get('Content-Length','0'))
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except Exception:
+            self._json(400,{"error":"bad json"}); return
+        required = ["name","mesh_ip","pub_addr","vless_port","reality_pub","short_id","sni","tinc_port","fw_base","uuid","host_b64","accept"]
+        if any(k not in payload for k in required):
+            self._json(400,{"error":"missing fields"}); return
+        data = load_peers()
+        if data.get('uuid') and data['uuid'] != payload['uuid']:
+            self._json(400,{"error":"uuid mismatch"}); return
+        if not data.get('uuid'):
+            data['uuid'] = payload['uuid']
+        payload['updated'] = int(time.time())
+        try:
+            raw = base64.b64decode(payload['host_b64'])
+            HOSTS_DIR.mkdir(parents=True, exist_ok=True)
+            (HOSTS_DIR / payload['name']).write_bytes(raw)
+        except Exception:
+            self._json(400,{"error":"bad host_b64"}); return
+        peers = [p for p in data['peers'] if p.get('name') != payload['name']]
+        peers.append({k:payload[k] for k in payload})
+        data['peers'] = peers
+        save_peers(data)
+        self._json(200, data)
+
+def run():
+    port = int(os.environ.get('REGISTRY_PORT','9000'))
+    httpd = HTTPServer(('0.0.0.0', port), Handler)
+    httpd.serve_forever()
+
+if __name__ == '__main__':
+    run()
+EOF
+}
+
+build_image() {
+  ensure_docker
+  write_docker_context
+  docker build -t "$IMAGE_TAG" /etc/vless-mesh/docker-node
+  if [[ -n "$IMAGE_REGISTRY" ]]; then
+    docker push "$IMAGE_TAG"
+  fi
+}
+
+write_compose() {
+  local file="/etc/vless-mesh/docker-compose.mesh.yml"
+  cat >"$file" <<EOF
+version: "3.9"
+services:
+  mesh:
+    image: $IMAGE_TAG
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /etc/tinc/mesh:/etc/tinc/mesh
+      - /usr/local/etc/xray:/usr/local/etc/xray
+      - /etc/vless-mesh:/etc/vless-mesh
+    environment:
+      - MODE=server
+      - ENABLE_REGISTRY=1
+      - ENABLE_IPERF=1
+      - REGISTRY_PORT=$REG_PORT
+    restart: unless-stopped
+EOF
+  echo "$file"
+}
+
+write_k8s_manifest() {
+  local file="/etc/vless-mesh/mesh-server.yaml"
+  cat >"$file" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-server
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mesh-server
+  template:
+    metadata:
+      labels:
+        app: mesh-server
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: $HOST_NODE
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: mesh
+          image: $IMAGE_TAG
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            - name: MODE
+              value: "server"
+            - name: ENABLE_REGISTRY
+              value: "1"
+            - name: ENABLE_IPERF
+              value: "1"
+            - name: REGISTRY_PORT
+              value: "$REG_PORT"
+          volumeMounts:
+            - name: tinc
+              mountPath: /etc/tinc/mesh
+            - name: xray
+              mountPath: /usr/local/etc/xray
+            - name: vless
+              mountPath: /etc/vless-mesh
+      volumes:
+        - name: tinc
+          hostPath:
+            path: /etc/tinc/mesh
+        - name: xray
+          hostPath:
+            path: /usr/local/etc/xray
+        - name: vless
+          hostPath:
+            path: /etc/vless-mesh
+EOF
+  echo "$file"
+}
 MESH_IP=""; PUB_ADDR=""; VLESS_PORT=443; TINC_PORT=6060; MTU=1400; UUID=""; REALITY_DEST="www.microsoft.com:443"; MESH_UUID=""; REG_PORT=9000; REG_TOKEN=""
+DEPLOY="host"; IMAGE_REGISTRY=""
+HOST_NODE=$(hostname -s)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mesh-ip) MESH_IP="$2"; shift 2;;
@@ -35,6 +255,8 @@ while [[ $# -gt 0 ]]; do
     --registry-port) REG_PORT="$2"; shift 2;;
     --registry-token) REG_TOKEN="$2"; shift 2;;
     --uuid) UUID="$2"; shift 2;;
+    --deploy) DEPLOY="$2"; shift 2;;
+    --image-registry) IMAGE_REGISTRY="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
@@ -43,11 +265,21 @@ done
 UUID=${UUID:-$(uuidgen)}
 MESH_UUID=${MESH_UUID:-$(uuidgen)}
 REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
+case "$DEPLOY" in
+  host|compose|k8s) ;;
+  *) echo "Unsupported --deploy $DEPLOY (expected host|compose|k8s)"; exit 1;;
+esac
+if [[ -n "$IMAGE_REGISTRY" && "$IMAGE_REGISTRY" != */ ]]; then
+  IMAGE_REGISTRY="$IMAGE_REGISTRY/"
+fi
+IMAGE_TAG="${IMAGE_REGISTRY}vless-mesh-node:latest"
 
 need_root
-apt-get update -qq
-apt-get install -yq tinc curl jq python3-cryptography python3 iperf3 >/dev/null
-command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+if [[ "$DEPLOY" == "host" ]]; then
+  apt-get update -qq
+  apt-get install -yq tinc curl jq python3-cryptography python3 iperf3 >/dev/null
+  command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
+fi
 
 # Reality keypair (X25519) for server; shortId 8 hex chars
 # reality key generation (supports both "Private key" and "PrivateKey" outputs)
@@ -165,11 +397,13 @@ cat >/usr/local/etc/xray/config.json <<EOF
 EOF
 
 echo mesh >/etc/tinc/nets.boot
-systemctl enable --now tinc@mesh
-systemctl enable --now xray
 
-# iperf3 server for throughput probing (P2P selection)
-cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
+if [[ "$DEPLOY" == "host" ]]; then
+  systemctl enable --now tinc@mesh
+  systemctl enable --now xray
+
+  # iperf3 server for throughput probing (P2P selection)
+  cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
 [Unit]
 Description=iperf3 server for mesh
 After=network.target
@@ -182,16 +416,16 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now iperf3-mesh.service
+  systemctl daemon-reload
+  systemctl enable --now iperf3-mesh.service
 
-# Mesh registry data
-mkdir -p /etc/vless-mesh
-echo "$REG_TOKEN" >/etc/vless-mesh/token
-chmod 600 /etc/vless-mesh/token
+  # Mesh registry data
+  mkdir -p /etc/vless-mesh
+  echo "$REG_TOKEN" >/etc/vless-mesh/token
+  chmod 600 /etc/vless-mesh/token
 
-HOST_B64=$(base64 -w0 "$BASE/hosts/server")
-cat >/etc/vless-mesh/peers.json <<EOF
+  HOST_B64=$(base64 -w0 "$BASE/hosts/server")
+  cat >/etc/vless-mesh/peers.json <<EOF
 {
   "uuid": "$MESH_UUID",
   "peers": [
@@ -212,7 +446,7 @@ cat >/etc/vless-mesh/peers.json <<EOF
 }
 EOF
 
-cat >/usr/local/sbin/mesh-registry.py <<'PY'
+  cat >/usr/local/sbin/mesh-registry.py <<'PY'
 #!/usr/bin/env python3
 import json, base64, os, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -295,9 +529,9 @@ def run():
 if __name__ == '__main__':
     run()
 PY
-chmod +x /usr/local/sbin/mesh-registry.py
+  chmod +x /usr/local/sbin/mesh-registry.py
 
-cat >/etc/systemd/system/mesh-registry.service <<EOF
+  cat >/etc/systemd/system/mesh-registry.service <<EOF
 [Unit]
 Description=Mesh registry API
 After=network.target
@@ -312,8 +546,44 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now mesh-registry.service
+  systemctl daemon-reload
+  systemctl enable --now mesh-registry.service
+
+else
+  mkdir -p /etc/vless-mesh
+  echo "$REG_TOKEN" >/etc/vless-mesh/token
+  chmod 600 /etc/vless-mesh/token
+  HOST_B64=$(base64 -w0 "$BASE/hosts/server")
+  cat >/etc/vless-mesh/peers.json <<EOF
+{
+  "uuid": "$MESH_UUID",
+  "peers": [
+    {
+      "name": "server",
+      "mesh_ip": "$MESH_IP",
+      "pub_addr": "$PUB_ADDR",
+      "vless_port": $VLESS_PORT,
+      "reality_pub": "$REALITY_PUB",
+      "short_id": "$SHORT_ID",
+      "sni": "$DEST_HOST",
+      "tinc_port": $TINC_PORT,
+      "fw_base": 7000,
+      "host_b64": "$HOST_B64",
+      "updated": $(date +%s)
+    }
+  ]
+}
+EOF
+  build_image
+  if [[ "$DEPLOY" == "compose" ]]; then
+    compose_file=$(write_compose)
+    docker compose -f "$compose_file" up -d
+  else
+    ensure_kubectl
+    manifest=$(write_k8s_manifest)
+    kubectl apply -f "$manifest"
+  fi
+fi
 
 cat <<EOF
 Server ready.
@@ -325,5 +595,6 @@ Server ready.
   Mesh UUID: $MESH_UUID
   Registry: http://$PUB_ADDR:$REG_PORT (token in /etc/vless-mesh/token)
   Tinc host file: /etc/tinc/mesh/hosts/server
+  Deploy mode: $DEPLOY (image $IMAGE_TAG)
 Distribute the host file, mesh UUID, registry token to clients.
 EOF

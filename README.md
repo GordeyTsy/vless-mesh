@@ -65,6 +65,8 @@ ping 10.10.0.4      # client -> client (p2p)
 - `--vless-port` (443), `--tinc-port` (6060), `--mtu` (1400)
 - `--reality-dest` (default www.microsoft.com:443)
 - `--mesh-uuid` (optional), `--registry-port` (9000), `--registry-token` (optional)
+- `--deploy` host|compose|k8s (default host). `compose` builds/starts a privileged container stack via docker compose; `k8s` writes `mesh-server.yaml` with hostNetwork+hostPath and applies it.
+- `--image-registry REG/` optional image prefix for compose/k8s (e.g. `registry:443/`).
 
 ### setup-client
 - `--server-addr` (required) server public IP/DNS
@@ -77,6 +79,7 @@ ping 10.10.0.4      # client -> client (p2p)
 - `--dial-only` outbound-only; does not accept inbound VLESS
 - `--top-peers N` keep N best peers by iperf3 (default 2) in dial-only mode
 - `--refresh-only` reuse saved config, re-pull registry, rerun iperf selection
+- `--deploy` host|docker|compose (default host). Docker/compose run a privileged container with host network + /dev/net/tun mounted; configs still live under `/etc/tinc/mesh` and `/usr/local/etc/xray`.
 
 ## Files
 - Server token: `/etc/vless-mesh/token`
@@ -121,8 +124,21 @@ Run `setup-client` once on the new node with its mesh IP, pub-addr, token. Exist
   .venv/bin/python backend/manage.py migrate   # first run; uses SQLite
   .venv/bin/python backend/manage.py runserver 0.0.0.0:8001
   ```
+ - Docker Compose (PostgreSQL + Django):
+   ```bash
+   docker compose up --build
+   # API on http://127.0.0.1:8001, DB persisted in pgdata volume
+   ```
+- Configure DB: by default SQLite; set `DATABASE_URL=postgres://user:pass@host:5432/db` to use Postgres (Compose sets this automatically).
 - Endpoints (GET):
   - `/api/status` — mesh health, registry/reality/service flags.
   - `/api/stats` — peers, iperf, RTT, MTU.
   - `/api/nodes` — node coordinates + links for the canvas.
 - CORS is permissive (`*`) so the static UI (served from file:// or another port) can call the API. Set `API_BASE` in `web/main.js` if you host elsewhere.
+
+## Compose / k8s deployment (mesh services)
+- Server compose: `./setup-server --deploy compose --mesh-ip 10.10.0.1 --pub-addr 1.2.3.4 --image-registry registry:443/` builds/pushes `vless-mesh-node:latest`, writes `/etc/vless-mesh/docker-compose.mesh.yml`, and runs `docker compose up -d` with host network + /dev/net/tun mounted.
+- Server k8s: `./setup-server --deploy k8s ...` writes `/etc/vless-mesh/mesh-server.yaml` (hostNetwork, hostPath volumes) and `kubectl apply -f` it; ensure the image is reachable (set `--image-registry` and push or pre-load).
+- Client docker: `./setup-client --deploy docker ...` generates configs under `/etc/{tinc,vless-mesh}` and launches `docker run --network host --cap-add NET_ADMIN --device /dev/net/tun vless-mesh-node:latest`.
+- Client compose: `./setup-client --deploy compose ...` writes `/etc/vless-mesh/docker-compose.client.yml` and runs it.
+- Default (host) behavior unchanged.
