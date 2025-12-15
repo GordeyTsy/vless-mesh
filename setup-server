@@ -16,7 +16,7 @@ setup-server --mesh-ip IP --pub-addr ADDR [options]
   --mesh-uuid UUID     Shared mesh UUID (default generate)
   --registry-port PORT Registry HTTP port (default 9000)
   --registry-token TOK Pre-shared token (default generate)
-  --deploy MODE        host|compose|k8s (default host)
+  --deploy MODE        host|compose|k8s|container (default host)
   --image-registry R/  Registry prefix for container image (e.g. registry:443/) for compose/k8s
   -h                   help
 EOF
@@ -263,11 +263,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$MESH_IP" && -n "$PUB_ADDR" ]] || { usage; exit 1; }
 UUID=${UUID:-$(uuidgen)}
-MESH_UUID=${MESH_UUID:-$(uuidgen)}
-REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
+if [[ "$DEPLOY" != "container" ]]; then
+  MESH_UUID=${MESH_UUID:-$(uuidgen)}
+  REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
+fi
 case "$DEPLOY" in
-  host|compose|k8s) ;;
-  *) echo "Unsupported --deploy $DEPLOY (expected host|compose|k8s)"; exit 1;;
+  host|compose|k8s|container) ;;
+  *) echo "Unsupported --deploy $DEPLOY (expected host|compose|k8s|container)"; exit 1;;
 esac
 if [[ -n "$IMAGE_REGISTRY" && "$IMAGE_REGISTRY" != */ ]]; then
   IMAGE_REGISTRY="$IMAGE_REGISTRY/"
@@ -281,11 +283,34 @@ if [[ "$DEPLOY" == "host" ]]; then
   command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
 fi
 
+# For container deployments, preserve stable identity across restarts by persisting it in /etc/vless-mesh/server.json.
+SERVER_STATE=/etc/vless-mesh/server.json
+mkdir -p /etc/vless-mesh
+if [[ "$DEPLOY" == "container" ]]; then
+  if [[ -f /etc/vless-mesh/token ]]; then
+    REG_TOKEN="$(cat /etc/vless-mesh/token | tr -d '\n' || true)"
+  fi
+  if [[ -f /etc/vless-mesh/peers.json ]]; then
+    MESH_UUID="$(python3 -c 'import json; print(json.load(open("/etc/vless-mesh/peers.json")).get("uuid",""))' 2>/dev/null || true)"
+  fi
+  if [[ -f "${SERVER_STATE}" ]]; then
+    REALITY_PRIV="$(python3 -c 'import json; print(json.load(open("/etc/vless-mesh/server.json")).get("reality_priv",""))' 2>/dev/null || true)"
+    REALITY_PUB="$(python3 -c 'import json; print(json.load(open("/etc/vless-mesh/server.json")).get("reality_pub",""))' 2>/dev/null || true)"
+    SHORT_ID="$(python3 -c 'import json; print(json.load(open("/etc/vless-mesh/server.json")).get("short_id",""))' 2>/dev/null || true)"
+    if [[ -z "${MESH_UUID}" ]]; then
+      MESH_UUID="$(python3 -c 'import json; print(json.load(open("/etc/vless-mesh/server.json")).get("mesh_uuid",""))' 2>/dev/null || true)"
+    fi
+  fi
+
+  MESH_UUID=${MESH_UUID:-$(uuidgen)}
+  REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
+fi
+
 # Reality keypair (X25519) for server; shortId 8 hex chars
 # reality key generation (supports both "Private key" and "PrivateKey" outputs)
 REALITY_KEYPAIR=$(xray x25519 || true)
-REALITY_PRIV=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Private key|PrivateKey/{print $3}')
-REALITY_PUB=$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Public key|PublicKey/{print $3}')
+REALITY_PRIV=${REALITY_PRIV:-$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Private key|PrivateKey/{print $3}')}
+REALITY_PUB=${REALITY_PUB:-$(printf "%s\n" "$REALITY_KEYPAIR" | awk '/Public key|PublicKey/{print $3}')}
 
 if [[ -z "$REALITY_PRIV" || -z "$REALITY_PUB" ]]; then
   # Fallback: generate X25519 with python to ensure Reality keys exist
@@ -314,11 +339,15 @@ PY
   REALITY_PUB=$(printf "%s" "$PY_KEYS" | sed -n '2p')
 fi
 
-SHORT_ID=$(openssl rand -hex 4)
+SHORT_ID=${SHORT_ID:-$(openssl rand -hex 4)}
 DEST_HOST=${REALITY_DEST%%:*}
+LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}' || true)"
+LAN_IP="${LAN_IP:-$(hostname -I | awk '{print $1}')}"
 
 BASE=/etc/tinc/mesh
-rm -rf "$BASE"
+if [[ "$DEPLOY" != "container" ]]; then
+  rm -rf "$BASE"
+fi
 mkdir -p "$BASE/hosts"
 
 cat >"$BASE/tinc.conf" <<EOF
@@ -345,10 +374,11 @@ ip link set \$IF down || true
 EOF
 chmod +x "$BASE/tinc-up" "$BASE/tinc-down"
 
-rm -f "$BASE/rsa_key.priv"
-tincd -n mesh -K4096 <<EOF
+if [[ ! -f "$BASE/rsa_key.priv" ]]; then
+  tincd -n mesh -K4096 <<EOF
 y
 EOF
+fi
 PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/server")
 cat >"$BASE/hosts/server" <<EOF
 Subnet = $MESH_IP/32
@@ -433,6 +463,7 @@ EOF
       "name": "server",
       "mesh_ip": "$MESH_IP",
       "pub_addr": "$PUB_ADDR",
+      "lan_ip": "$LAN_IP",
       "vless_port": $VLESS_PORT,
       "reality_pub": "$REALITY_PUB",
       "short_id": "$SHORT_ID",
@@ -549,6 +580,158 @@ EOF
   systemctl daemon-reload
   systemctl enable --now mesh-registry.service
 
+elif [[ "$DEPLOY" == "container" ]]; then
+  REG_TOKEN=${REG_TOKEN:-$(openssl rand -hex 16)}
+  echo "$REG_TOKEN" >/etc/vless-mesh/token
+  chmod 600 /etc/vless-mesh/token
+
+  # Persist server identity for stable restarts.
+  cat >"${SERVER_STATE}" <<EOF
+{
+  "mesh_uuid": "$MESH_UUID",
+  "reality_priv": "$REALITY_PRIV",
+  "reality_pub": "$REALITY_PUB",
+  "short_id": "$SHORT_ID"
+}
+EOF
+  chmod 600 "${SERVER_STATE}" || true
+
+  HOST_B64=$(base64 -w0 "$BASE/hosts/server")
+  MESH_UUID="$MESH_UUID" MESH_IP="$MESH_IP" PUB_ADDR="$PUB_ADDR" LAN_IP="$LAN_IP" \
+    VLESS_PORT="$VLESS_PORT" REALITY_PUB="$REALITY_PUB" SHORT_ID="$SHORT_ID" DEST_HOST="$DEST_HOST" \
+    TINC_PORT="$TINC_PORT" HOST_B64="$HOST_B64" \
+    python3 - <<'PY'
+import json, os, time
+from pathlib import Path
+
+path = Path("/etc/vless-mesh/peers.json")
+uuid = os.environ.get("MESH_UUID", "")
+peer = {
+  "name": "server",
+  "mesh_ip": os.environ["MESH_IP"],
+  "pub_addr": os.environ["PUB_ADDR"],
+  "lan_ip": os.environ.get("LAN_IP", ""),
+  "vless_port": int(os.environ.get("VLESS_PORT", "443")),
+  "reality_pub": os.environ.get("REALITY_PUB", ""),
+  "short_id": os.environ.get("SHORT_ID", ""),
+  "sni": os.environ.get("DEST_HOST", ""),
+  "tinc_port": int(os.environ.get("TINC_PORT", "6060")),
+  "fw_base": 7000,
+  "host_b64": os.environ.get("HOST_B64", ""),
+  "updated": int(time.time()),
+}
+
+if path.exists():
+  try:
+    data = json.loads(path.read_text())
+  except Exception:
+    data = {"uuid": uuid, "peers": []}
+else:
+  data = {"uuid": uuid, "peers": []}
+
+if not data.get("uuid"):
+  data["uuid"] = uuid
+
+peers = [p for p in data.get("peers", []) if p.get("name") != "server"]
+peers.append(peer)
+data["peers"] = peers
+
+path.write_text(json.dumps(data, indent=2))
+PY
+
+  cat >/usr/local/sbin/mesh-registry.py <<'PY'
+#!/usr/bin/env python3
+import json, base64, os, sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+DATA = Path(sys.argv[1]) if len(sys.argv)>1 else Path('/etc/vless-mesh/peers.json')
+TOKEN_FILE = Path('/etc/vless-mesh/token')
+HOSTS_DIR = Path('/etc/tinc/mesh/hosts')
+
+def load_token():
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except Exception:
+        return ''
+
+def load_peers():
+    if DATA.exists():
+        return json.loads(DATA.read_text())
+    return {"uuid": None, "peers": []}
+
+def save_peers(data):
+    tmp = DATA.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(DATA)
+
+class Handler(BaseHTTPRequestHandler):
+    def _auth(self):
+        token = self.headers.get('X-Mesh-Token','')
+        return token == load_token()
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path != '/peers':
+            self.send_response(404); self.end_headers(); return
+        if not self._auth():
+            self.send_response(401); self.end_headers(); return
+        data = load_peers()
+        self._json(200, data)
+    def do_POST(self):
+        if self.path != '/register':
+            self.send_response(404); self.end_headers(); return
+        if not self._auth():
+            self.send_response(401); self.end_headers(); return
+        length = int(self.headers.get('Content-Length','0'))
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except Exception:
+            self._json(400,{"error":"bad json"}); return
+        required = ["name","mesh_ip","pub_addr","vless_port","reality_pub","short_id","sni","tinc_port","fw_base","uuid","host_b64","accept"]
+        if any(k not in payload for k in required):
+            self._json(400,{"error":"missing fields"}); return
+        data = load_peers()
+        if data.get('uuid') and data['uuid'] != payload['uuid']:
+            self._json(400,{"error":"uuid mismatch"}); return
+        if not data.get('uuid'):
+            data['uuid'] = payload['uuid']
+        payload['updated'] = int(time.time())
+        try:
+            raw = base64.b64decode(payload['host_b64'])
+            HOSTS_DIR.mkdir(parents=True, exist_ok=True)
+            (HOSTS_DIR / payload['name']).write_bytes(raw)
+        except Exception:
+            self._json(400,{"error":"bad host_b64"}); return
+        peers = [p for p in data['peers'] if p.get('name') != payload['name']]
+        peers.append({k:payload[k] for k in payload})
+        data['peers'] = peers
+        save_peers(data)
+        self._json(200, data)
+
+def run():
+    port = int(os.environ.get('REGISTRY_PORT','9000'))
+    httpd = HTTPServer(('0.0.0.0', port), Handler)
+    httpd.serve_forever()
+
+if __name__ == '__main__':
+    run()
+PY
+  chmod +x /usr/local/sbin/mesh-registry.py
+
+  export REGISTRY_PORT="$REG_PORT"
+  trap 'kill 0' TERM INT
+  ip link del mesh0 >/dev/null 2>&1 || true
+  tincd -n mesh -D &
+  xray run -c /usr/local/etc/xray/config.json &
+  python3 /usr/local/sbin/mesh-registry.py /etc/vless-mesh/peers.json &
+  iperf3 -s -p 5201 &
+  wait -n
+
 else
   mkdir -p /etc/vless-mesh
   echo "$REG_TOKEN" >/etc/vless-mesh/token
@@ -562,6 +745,7 @@ else
       "name": "server",
       "mesh_ip": "$MESH_IP",
       "pub_addr": "$PUB_ADDR",
+      "lan_ip": "$LAN_IP",
       "vless_port": $VLESS_PORT,
       "reality_pub": "$REALITY_PUB",
       "short_id": "$SHORT_ID",

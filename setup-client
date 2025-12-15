@@ -23,7 +23,7 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
   --dial-only            Only outbound VLESS (for NAT); do not accept inbound
   --top-peers N          For dial-only: keep top N peers by iperf3 (default 2)
-  --deploy MODE          host|docker|compose (default host)
+  --deploy MODE          host|docker|compose|k8s (default host)
   --refresh-only         Only refresh configs (use saved config)
   -h                     Help
 H
@@ -99,27 +99,32 @@ EOF
 }
 
 SERVER_ADDR=""; MESH_IP=""; TOKEN=""; NAME=""; PUB_ADDR="";
+SERVER_ADDR_SET=0; MESH_IP_SET=0; TOKEN_SET=0; NAME_SET=0; PUB_ADDR_SET=0;
 VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID="";
+VLESS_PORT_SET=0; TINC_PORT_SET=0; FW_BASE_SET=0; MTU_SET=0; MESH_UUID_SET=0;
 REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0; DIAL_ONLY=0; TOP_PEERS=2
+REG_PORT_SET=0; REALITY_DEST_SET=0; DIAL_ONLY_SET=0; TOP_PEERS_SET=0;
 DEPLOY="host"
+DEPLOY_SET=0
+XRAY_CONFIG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --server-addr) SERVER_ADDR="$2"; shift 2;;
-    --mesh-ip) MESH_IP="$2"; shift 2;;
-    --token) TOKEN="$2"; shift 2;;
-    --name) NAME="$2"; shift 2;;
-    --pub-addr) PUB_ADDR="$2"; shift 2;;
-    --vless-port) VLESS_PORT="$2"; shift 2;;
-    --tinc-port) TINC_PORT="$2"; shift 2;;
-    --fw-base) FW_BASE="$2"; shift 2;;
-    --mtu) MTU="$2"; shift 2;;
-    --mesh-uuid) MESH_UUID="$2"; shift 2;;
-    --registry-port) REG_PORT="$2"; shift 2;;
-    --reality-dest) REALITY_DEST="$2"; shift 2;;
-    --dial-only) DIAL_ONLY=1; shift 1;;
-    --top-peers) TOP_PEERS="$2"; shift 2;;
-    --deploy) DEPLOY="$2"; shift 2;;
+    --server-addr) SERVER_ADDR="$2"; SERVER_ADDR_SET=1; shift 2;;
+    --mesh-ip) MESH_IP="$2"; MESH_IP_SET=1; shift 2;;
+    --token) TOKEN="$2"; TOKEN_SET=1; shift 2;;
+    --name) NAME="$2"; NAME_SET=1; shift 2;;
+    --pub-addr) PUB_ADDR="$2"; PUB_ADDR_SET=1; shift 2;;
+    --vless-port) VLESS_PORT="$2"; VLESS_PORT_SET=1; shift 2;;
+    --tinc-port) TINC_PORT="$2"; TINC_PORT_SET=1; shift 2;;
+    --fw-base) FW_BASE="$2"; FW_BASE_SET=1; shift 2;;
+    --mtu) MTU="$2"; MTU_SET=1; shift 2;;
+    --mesh-uuid) MESH_UUID="$2"; MESH_UUID_SET=1; shift 2;;
+    --registry-port) REG_PORT="$2"; REG_PORT_SET=1; shift 2;;
+    --reality-dest) REALITY_DEST="$2"; REALITY_DEST_SET=1; shift 2;;
+    --dial-only) DIAL_ONLY=1; DIAL_ONLY_SET=1; shift 1;;
+    --top-peers) TOP_PEERS="$2"; TOP_PEERS_SET=1; shift 2;;
+    --deploy) DEPLOY="$2"; DEPLOY_SET=1; shift 2;;
     --refresh-only) REFRESH_ONLY=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
@@ -127,8 +132,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$DEPLOY" in
-  host|docker|compose) ;;
-  *) echo "Unsupported --deploy $DEPLOY (expected host|docker|compose)"; exit 1;;
+  host|docker|compose|k8s) ;;
+  *) echo "Unsupported --deploy $DEPLOY (expected host|docker|compose|k8s)"; exit 1;;
 esac
 
 need_root
@@ -137,25 +142,25 @@ SELF_JSON=/etc/vless-mesh/self.json
 
 # Load saved config if present
 if [[ -f $CONFIG_JSON ]]; then
-  [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(jq -r '.server_addr' $CONFIG_JSON)
-  [[ -z "$MESH_IP" ]] && MESH_IP=$(jq -r '.mesh_ip' $CONFIG_JSON)
-  [[ -z "$TOKEN" ]] && TOKEN=$(jq -r '.token' $CONFIG_JSON)
-  [[ -z "$PUB_ADDR" || "$PUB_ADDR" == "" ]] && PUB_ADDR=$(jq -r '.pub_addr' $CONFIG_JSON)
-  [[ -z "$MESH_UUID" || "$MESH_UUID" == "" ]] && MESH_UUID=$(jq -r '.mesh_uuid' $CONFIG_JSON)
-  VLESS_PORT=$(jq -r '.vless_port' $CONFIG_JSON)
-  TINC_PORT=$(jq -r '.tinc_port' $CONFIG_JSON)
-  FW_BASE=$(jq -r '.fw_base' $CONFIG_JSON)
-  REG_PORT=$(jq -r '.reg_port' $CONFIG_JSON)
-  REALITY_DEST=$(jq -r '.reality_dest' $CONFIG_JSON)
-  TOP_PEERS=$(jq -r '.top_peers // 2' $CONFIG_JSON)
-  DIAL_ONLY=$(jq -r '.dial_only // 0' $CONFIG_JSON)
+  [[ $SERVER_ADDR_SET -eq 0 ]] && SERVER_ADDR=$(jq -r '.server_addr' $CONFIG_JSON)
+  [[ $MESH_IP_SET -eq 0 ]] && MESH_IP=$(jq -r '.mesh_ip' $CONFIG_JSON)
+  [[ $TOKEN_SET -eq 0 ]] && TOKEN=$(jq -r '.token' $CONFIG_JSON)
+  [[ $PUB_ADDR_SET -eq 0 ]] && PUB_ADDR=$(jq -r '.pub_addr' $CONFIG_JSON)
+  [[ $MESH_UUID_SET -eq 0 ]] && MESH_UUID=$(jq -r '.mesh_uuid' $CONFIG_JSON)
+  [[ $VLESS_PORT_SET -eq 0 ]] && VLESS_PORT=$(jq -r '.vless_port' $CONFIG_JSON)
+  [[ $TINC_PORT_SET -eq 0 ]] && TINC_PORT=$(jq -r '.tinc_port' $CONFIG_JSON)
+  [[ $FW_BASE_SET -eq 0 ]] && FW_BASE=$(jq -r '.fw_base' $CONFIG_JSON)
+  [[ $REG_PORT_SET -eq 0 ]] && REG_PORT=$(jq -r '.reg_port' $CONFIG_JSON)
+  [[ $REALITY_DEST_SET -eq 0 ]] && REALITY_DEST=$(jq -r '.reality_dest' $CONFIG_JSON)
+  [[ $TOP_PEERS_SET -eq 0 ]] && TOP_PEERS=$(jq -r '.top_peers // 2' $CONFIG_JSON)
+  [[ $DIAL_ONLY_SET -eq 0 ]] && DIAL_ONLY=$(jq -r '.dial_only // 0' $CONFIG_JSON)
 fi
 
 if [[ $REFRESH_ONLY -eq 0 ]]; then
   [[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
   if [[ "$DEPLOY" == "host" ]]; then
     apt-get update -qq
-    apt-get install -yq tinc curl jq python3 python3-cryptography iperf3 >/dev/null
+    apt-get install -yq tinc curl jq python3 python3-cryptography iperf3 openssl uuid-runtime >/dev/null
     command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
   fi
 else
@@ -163,8 +168,16 @@ else
 fi
 
 NAME=${NAME:-$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')}
+NAME="$(printf '%s' "${NAME}" | sed 's/[^A-Za-z0-9]/_/g')"
 PUB_ADDR=${PUB_ADDR:-$(hostname -I | awk '{print $1}')}
 DEST_HOST=${REALITY_DEST%%:*}
+if [[ -z "${XRAY_CONFIG:-}" ]]; then
+  if [[ "$DEPLOY" == "host" ]]; then
+    XRAY_CONFIG="/etc/vless-mesh/xray.json"
+  else
+    XRAY_CONFIG="/usr/local/etc/xray/config.json"
+  fi
+fi
 
 # Reality keys
 if [[ -f "$SELF_JSON" ]]; then
@@ -233,7 +246,14 @@ EOF
 fi
 
 SELF_HOST="$BASE/hosts/$NAME"
-PUBK=$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$BASE/hosts/$NAME" 2>/dev/null)
+PUBK=""
+if command -v openssl >/dev/null 2>&1 && [[ -f "$BASE/rsa_key.priv" ]]; then
+  # Ensure we can (re)create hosts/$NAME even when the node name changes and only rsa_key.priv exists.
+  PUBK="$(openssl rsa -in "$BASE/rsa_key.priv" -RSAPublicKey_out 2>/dev/null || true)"
+fi
+if [[ -z "${PUBK}" ]]; then
+  PUBK="$(awk 'BEGIN{p=0} /^-----BEGIN RSA PUBLIC KEY-----/{p=1} /^-----END/{print;exit} {if(p)print}' "$SELF_HOST" 2>/dev/null || true)"
+fi
 cat >"$SELF_HOST" <<EOF
 Subnet = $MESH_IP/32
 $PUBK
@@ -305,10 +325,12 @@ build_from_peers() {
   local peers_path="$1"
   NAME="$NAME" MESH_UUID="$MESH_UUID" REALITY_PRIV="$REALITY_PRIV" REALITY_PUB="$REALITY_PUB" SHORT_ID="$SHORT_ID" DEST_HOST="$DEST_HOST" \
   VLESS_PORT="$VLESS_PORT" TINC_PORT="$TINC_PORT" FW_BASE="$FW_BASE" BASE="$BASE" SELF_PUB="$PUB_ADDR" \
+  XRAY_CONFIG="$XRAY_CONFIG" \
   python3 - "$peers_path" <<'PY'
 import sys, json, base64, os, ipaddress
 peers_path=sys.argv[1]
 name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); base_dir=os.environ['BASE']; self_pub=os.environ['SELF_PUB']
+xray_cfg=os.environ.get('XRAY_CONFIG','/usr/local/etc/xray/config.json')
 hosts_dir=os.path.join(base_dir,'hosts')
 with open(peers_path) as f: data=json.load(f)
 peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
@@ -355,9 +377,10 @@ for p in peers:
         connect_lines.append(f"ConnectTo = {p['name']}")
     else:
         port=fw_base+idx_vless; idx_vless+=1
-        inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp"}})
+        # dokodemo-door needs an explicit destination; the server side will redirect to tinc anyway
+        inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp","address":"127.0.0.1","port":int(p.get('tinc_port',tinc_port))}})
         outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":peer_pub,"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
-    routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"})
+        routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"} )
         raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
         rsa_lines=[]; grab=False
         for line in text.splitlines():
@@ -369,7 +392,8 @@ for p in peers:
         open(os.path.join(hosts_dir,p['name']),'w').write(host_content)
         connect_lines.append(f"ConnectTo = {p['name']}" )
 
-json.dump({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}, open('/usr/local/etc/xray/config.json','w'), indent=2)
+os.makedirs(os.path.dirname(xray_cfg), exist_ok=True)
+json.dump({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,"routing":{"rules":routes}}, open(xray_cfg,'w'), indent=2)
 
 conf_path=os.path.join(base_dir,'tinc.conf')
 with open(conf_path,'r') as cf: lines=[l for l in cf if not l.startswith('ConnectTo = ')]
@@ -414,14 +438,38 @@ build_from_peers "$PEERS_FOR_BUILD"
 echo mesh >/etc/tinc/nets.boot
 
 if [[ "$DEPLOY" == "host" ]]; then
-  systemctl enable --now xray
-  systemctl restart xray
+  cat >/etc/systemd/system/vless-mesh-xray.service <<EOF
+[Unit]
+Description=Xray for VLESS mesh
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -config ${XRAY_CONFIG}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now vless-mesh-xray.service
+  systemctl restart vless-mesh-xray.service
   systemctl enable --now tinc@mesh
   systemctl restart tinc@mesh
 
-  # iperf3 server for accepting nodes
-  if [[ $DIAL_ONLY -eq 0 ]]; then
-    cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
+  # If the server publishes a LAN/internal IP, route it via mesh.
+  # This is needed when the Kubernetes "kubernetes" Service Endpoint points to the server LAN IP.
+  SERVER_MESH_IP="$(jq -r '.peers[] | select(.name=="server") | .mesh_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
+  SERVER_LAN_IP="$(jq -r '.peers[] | select(.name=="server") | .lan_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
+  if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
+    for _ in {1..10}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
+    ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+  fi
+
+  if [[ $REFRESH_ONLY -eq 0 ]]; then
+    # iperf3 server for accepting nodes
+    if [[ $DIAL_ONLY -eq 0 ]]; then
+      cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
 [Unit]
 Description=iperf3 server for mesh
 After=network.target
@@ -434,19 +482,19 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now iperf3-mesh.service
-  fi
+      systemctl daemon-reload
+      systemctl enable --now iperf3-mesh.service
+    fi
 
-  # mesh-refresh calls this script with --refresh-only
-  cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
+    # mesh-refresh calls this script with --refresh-only
+    cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
 #!/usr/bin/env bash
 set -euo pipefail
 /usr/local/bin/setup-client --refresh-only
 REF
-  chmod +x /usr/local/sbin/mesh-refresh.sh
+    chmod +x /usr/local/sbin/mesh-refresh.sh
 
-  cat >/etc/systemd/system/mesh-refresh.service <<EOF
+    cat >/etc/systemd/system/mesh-refresh.service <<EOF
 [Unit]
 Description=Refresh VLESS mesh peers
 After=network.target
@@ -459,7 +507,7 @@ ExecStart=/usr/local/sbin/mesh-refresh.sh
 WantedBy=multi-user.target
 EOF
 
-  cat >/etc/systemd/system/mesh-refresh.timer <<EOF
+    cat >/etc/systemd/system/mesh-refresh.timer <<EOF
 [Unit]
 Description=Periodic VLESS mesh refresh
 
@@ -471,9 +519,68 @@ OnUnitActiveSec=120
 WantedBy=timers.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now mesh-refresh.timer
-  systemctl start mesh-refresh.service
+    systemctl daemon-reload
+    systemctl enable --now mesh-refresh.timer
+    systemctl start mesh-refresh.service
+  fi
+elif [[ "$DEPLOY" == "k8s" ]]; then
+  if [[ $REFRESH_ONLY -eq 1 ]]; then
+    echo "Refreshed."
+    exit 0
+  fi
+
+  marker="/etc/vless-mesh/managed-by-k8s"
+  if [[ -f "${marker}" ]]; then
+    ip link del mesh0 >/dev/null 2>&1 || true
+  else
+    if ip link show mesh0 >/dev/null 2>&1; then
+      echo "mesh0 exists but is not managed by this DaemonSet; refusing to override. Sleeping."
+      sleep infinity
+    fi
+  fi
+
+  echo "managed-by-k8s $(date -u +%FT%TZ)" >"${marker}" 2>/dev/null || true
+
+  trap 'kill 0' TERM INT
+
+  tincd -n mesh -D &
+  TINC_PID=$!
+
+  # If the server publishes a LAN/internal IP, route it via mesh.
+  SERVER_MESH_IP="$(jq -r '.peers[] | select(.name=="server") | .mesh_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
+  SERVER_LAN_IP="$(jq -r '.peers[] | select(.name=="server") | .lan_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
+  if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
+    for _ in {1..20}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
+    ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+  fi
+
+  if [[ $DIAL_ONLY -eq 0 ]]; then
+    iperf3 -s -p 5201 &
+  fi
+
+  # Restart xray on failures, and reload it when configs refresh.
+  xray_supervisor() {
+    while true; do
+      xray run -c "$XRAY_CONFIG" &
+      local pid=$!
+      wait "$pid" || true
+      sleep 2
+    done
+  }
+
+  refresh_loop() {
+    while true; do
+      sleep 120
+      if /usr/local/bin/setup-client --refresh-only --deploy k8s >/dev/null 2>&1; then
+        pkill -f 'xray run -c' >/dev/null 2>&1 || true
+      fi
+    done
+  }
+
+  xray_supervisor &
+  refresh_loop &
+
+  wait "$TINC_PID"
 else
   build_image
   if [[ "$DEPLOY" == "docker" ]]; then
