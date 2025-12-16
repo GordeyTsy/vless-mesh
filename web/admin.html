@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VLESS Mesh • Админ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./main.css?v=3" />
+</head>
+<body>
+  <div class="page auth-page">
+    <div class="glow-blob glow-1"></div>
+    <div class="glow-blob glow-2"></div>
+    <div class="liquid-blob blob-a" aria-hidden="true"></div>
+    <div class="liquid-blob blob-b" aria-hidden="true"></div>
+
+    <div class="auth-header">
+      <div>
+        <p class="eyebrow">VLESS + Tinc Mesh</p>
+        <h1>Админ: заявки</h1>
+        <p class="lede">Используйте admin-token для загрузки и утверждения заявок. Кнопки управляют статусами через /api/requests.</p>
+      </div>
+      <div class="badge beta">beta</div>
+    </div>
+
+    <div class="card dashboard-card">
+      <div class="dash-head">
+        <div>
+          <div class="eyebrow">Заявки</div>
+          <h3>Список заявок</h3>
+        </div>
+        <div class="admin-controls">
+          <input type="password" id="admin-token-requests" placeholder="X-Mesh-Admin-Token" />
+          <button id="load-requests" class="cta ghost-cta" type="button">Обновить</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="simple-table">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Комментарий</th>
+              <th>Статус</th>
+              <th>Токен</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody id="admin-requests-body">
+            <tr><td colspan="5" class="muted">Заявки не загружены</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="admin-requests-status" class="status-inline muted"></div>
+    </div>
+  </div>
+
+  <svg class="liquid-filters" aria-hidden="true" width="0" height="0" focusable="false">
+    <filter id="liquid-distort" x="-20%" y="-20%" width="140%" height="140%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012 0.02" numOctaves="2" seed="7" result="noise">
+        <animate attributeName="baseFrequency" dur="18s" values="0.012 0.02;0.02 0.012;0.015 0.018;0.012 0.02" repeatCount="indefinite" />
+      </feTurbulence>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="14" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </svg>
+
+  <script src="./admin.js"></script>
+</body>
+</html>

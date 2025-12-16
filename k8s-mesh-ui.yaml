@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vless-mesh-ui
+  labels:
+    app: vless-mesh-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vless-mesh-ui
+  template:
+    metadata:
+      labels:
+        app: vless-mesh-ui
+    spec:
+      initContainers:
+        - name: migrate
+          image: registry:443/vless-mesh-backend:latest
+          workingDir: /app/backend
+          env:
+            - name: MESH_ADMIN_TOKEN
+              value: mesh-admin
+          command: ["sh", "-c", "python manage.py migrate"]
+      containers:
+        - name: backend
+          image: registry:443/vless-mesh-backend:latest
+          workingDir: /app/backend
+          env:
+            - name: MESH_ADMIN_TOKEN
+              value: mesh-admin
+          command: ["sh", "-c", "gunicorn --workers=3 --bind=0.0.0.0:8001 meshbackend.wsgi:application"]
+          ports:
+            - containerPort: 8001
+        - name: web
+          image: registry:443/vless-mesh-web:latest
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vless-mesh-ui
+  labels:
+    app: vless-mesh-ui
+spec:
+  selector:
+    app: vless-mesh-ui
+  ports:
+    - name: web
+      port: 8080
+      targetPort: 80
+    - name: api
+      port: 8001
+      targetPort: 8001

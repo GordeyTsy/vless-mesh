@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vless-mesh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-client-config
+  namespace: vless-mesh
+data:
+  vless_port: "8443"
+  tinc_port: "6060"
+  fw_base: "7000"
+  reg_port: "9000"
+  reality_dest: "www.microsoft.com:443"
+  dial_only: "0"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-client
+  namespace: vless-mesh
+  labels:
+    app: vless-mesh-client
+spec:
+  selector:
+    matchLabels:
+      app: vless-mesh-client
+  template:
+    metadata:
+      labels:
+        app: vless-mesh-client
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+      containers:
+      - name: mesh-client
+        image: registry:443/vless-mesh-node:latest
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN","NET_RAW"]
+        env:
+        - name: NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: SERVER_ADDR
+          valueFrom:
+            secretKeyRef:
+              name: mesh-client-secret
+              key: server_addr
+        - name: MESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mesh-client-secret
+              key: token
+        - name: MESH_UUID
+          valueFrom:
+            secretKeyRef:
+              name: mesh-client-secret
+              key: mesh_uuid
+        - name: VLESS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: vless_port
+        - name: TINC_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: tinc_port
+        - name: FW_BASE
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: fw_base
+        - name: REG_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: reg_port
+        - name: REALITY_DEST
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: reality_dest
+        - name: MESH_DIAL_ONLY
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: dial_only
+        volumeMounts:
+        - name: tinc-etc
+          mountPath: /etc/tinc/mesh
+        - name: xray-etc
+          mountPath: /usr/local/etc/xray
+        - name: vless-etc
+          mountPath: /etc/vless-mesh
+        - name: dev-net-tun
+          mountPath: /dev/net/tun
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+      volumes:
+      - name: tinc-etc
+        hostPath:
+          path: /etc/tinc/mesh
+          type: DirectoryOrCreate
+      - name: xray-etc
+        hostPath:
+          path: /usr/local/etc/xray
+          type: DirectoryOrCreate
+      - name: vless-etc
+        hostPath:
+          path: /etc/vless-mesh
+          type: DirectoryOrCreate
+      - name: dev-net-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
