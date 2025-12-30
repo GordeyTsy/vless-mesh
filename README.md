@@ -11,9 +11,10 @@ Tested on Ubuntu 24.04 (LXD), but scripts target Debian/Ubuntu-like systems.
 - LAN-aware: peers in the same private /24 connect directly via tinc (no VLESS overhead).
 - Mesh registry on server to distribute host files & Reality params (token-protected).
 - Auto-refresh timer on clients.
+- Optional kubelet node IP rewiring to mesh IP when running on Kubernetes nodes.
 
 ## Dependencies installed by scripts
-- Packages: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `iperf3`, `xray-core` (if missing, installed via official script).
+- Packages: `tinc`, `curl`, `jq`, `python3`, `python3-cryptography`, `iperf3`, `ipset`, `iptables`, `xray-core` (if missing, installed via official script).
 - Services: `tinc@mesh`, `xray.service`, `mesh-registry.service` (server), `mesh-refresh.timer` (clients), `iperf3-mesh.service` (accepting nodes).
 
 ## Ports & network
@@ -28,6 +29,8 @@ Tested on Ubuntu 24.04 (LXD), but scripts target Debian/Ubuntu-like systems.
 1) **Server** (reachable IP/DNS):
 ```bash
 sudo ./setup-server --mesh-ip 10.10.0.1 --pub-addr <SERVER_PUBLIC_IP>
+# or auto mesh IP (10.10.0.<last_octet_of_host_ip>):
+sudo ./setup-server --pub-addr <SERVER_PUBLIC_IP>
 ```
 Output: Mesh UUID, Reality public key/shortId, registry token, host file `/etc/tinc/mesh/hosts/server`.
 
@@ -36,19 +39,19 @@ Standard (accepts inbound):
 ```bash
 sudo ./setup-client \
   --server-addr <SERVER_PUBLIC_IP> \
-  --mesh-ip 10.10.0.X \
   --pub-addr <THIS_PUBLIC_OR_DNS> \
   --token <TOKEN>
 ```
+Tip: if the registry port is blocked or the server is not directly reachable, you can point `--server-addr` to any existing mesh node; non-peer traffic to `:443` is relayed to the server by default, and `setup-client` will fall back to port `443` when `9000` is unavailable.
 NAT dial-only (outbound only) with best-peer selection (top 2):
 ```bash
 sudo ./setup-client \
   --server-addr <SERVER_PUBLIC_IP> \
-  --mesh-ip 10.10.0.X \
   --pub-addr <THIS_LAN_IP_OR_PUBLIC> \
   --token <TOKEN> \
   --dial-only --top-peers 2
 ```
+`--mesh-ip` can be omitted or set to `auto` to derive `10.10.0.<last_octet>` from the host IP.
 Peers in same private /24 automatically use direct tinc TCP (no VLESS) for lower latency.
 
 3) **Verify**
@@ -60,17 +63,19 @@ ping 10.10.0.4      # client -> client (p2p)
 
 ## Flags reference
 ### setup-server
-- `--mesh-ip` (required) server mesh /24 IP
+- `--mesh-ip` server mesh /24 IP (default auto from host IP; supports `auto`)
 - `--pub-addr` (required) public/DNS reachable by clients
 - `--vless-port` (443), `--tinc-port` (6060), `--mtu` (1400)
 - `--reality-dest` (default www.microsoft.com:443)
 - `--mesh-uuid` (optional), `--registry-port` (9000), `--registry-token` (optional)
 - `--deploy` host|compose|k8s (default host). `compose` builds/starts a privileged container stack via docker compose; `k8s` writes `mesh-server.yaml` with hostNetwork+hostPath and applies it.
 - `--image-registry REG/` optional image prefix for compose/k8s (e.g. `registry:443/`).
+- `--k8s-clients` / `--no-k8s-clients` toggle mesh client DaemonSet install (auto when kubectl is present).
+- `--no-kubelet-node-ip` skip setting kubelet `--node-ip` to the mesh IP.
 
 ### setup-client
 - `--server-addr` (required) server public IP/DNS
-- `--mesh-ip` (required) static mesh /24 IP
+- `--mesh-ip` static mesh /24 IP (default auto from host IP; supports `auto`)
 - `--token` (required) registry token
 - `--pub-addr` public/DNS for this node (defaults to first IP)
 - `--name` tinc node name (default hostname)
@@ -78,8 +83,11 @@ ping 10.10.0.4      # client -> client (p2p)
 - `--mesh-uuid`, `--registry-port`, `--reality-dest`
 - `--dial-only` outbound-only; does not accept inbound VLESS
 - `--top-peers N` keep N best peers by iperf3 (default 2) in dial-only mode
+- `--relay-server` / `--no-relay-server` toggle relaying non-peer `:443` traffic to the server (default on)
+- `--relay-port` local relay listen port (default 4443)
 - `--refresh-only` reuse saved config, re-pull registry, rerun iperf selection
-- `--deploy` host|docker|compose (default host). Docker/compose run a privileged container with host network + /dev/net/tun mounted; configs still live under `/etc/tinc/mesh` and `/usr/local/etc/xray`.
+- `--deploy` host|docker|compose|k8s (default host). Docker/compose run a privileged container with host network + /dev/net/tun mounted; configs still live under `/etc/tinc/mesh` and `/usr/local/etc/xray`.
+- `--no-kubelet-node-ip` skip setting kubelet `--node-ip` to the mesh IP (host deploy only).
 
 ## Files
 - Server token: `/etc/vless-mesh/token`
@@ -102,7 +110,10 @@ sudo ./setup-client --refresh-only
 Uses saved config/self, re-fetches registry, reruns iperf (for dial-only), rebuilds xray/tinc, restarts services.
 
 ## Adding a new client later
-Run `setup-client` once on the new node with its mesh IP, pub-addr, token. Existing nodes will learn it on next refresh (timer every 2 minutes).
+Run `setup-client` once on the new node with its mesh IP (or `auto`), pub-addr, token. Existing nodes will learn it on next refresh (timer every 2 minutes).
+
+## Kubernetes auto clients
+When `setup-server` runs on a control-plane with `kubectl`, it also creates the `vless-mesh` namespace, `mesh-client` secret/configmap, and applies a DaemonSet to all non-control-plane nodes. It also updates kubelet `--node-ip` to the mesh IP by default (use `--no-kubelet-node-ip` to skip). Set `--image-registry registry:443/` to point the DaemonSet at your in-cluster registry.
 
 ## Troubleshooting
 - No ping / “unknown identity”: run `--refresh-only` to regenerate hosts; ensure token/mesh UUID correct.

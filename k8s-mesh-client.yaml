@@ -9,12 +9,14 @@ metadata:
   name: mesh-client-config
   namespace: vless-mesh
 data:
-  vless_port: "8443"
+  vless_port: "443"
   tinc_port: "6060"
-  fw_base: "7000"
+  fw_base: "17000"
   reg_port: "9000"
   reality_dest: "www.microsoft.com:443"
   dial_only: "0"
+  relay_server: "1"
+  relay_port: "4443"
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -46,15 +48,22 @@ spec:
       containers:
       - name: mesh-client
         image: registry:443/vless-mesh-node:latest
+        imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
           capabilities:
             add: ["NET_ADMIN","NET_RAW"]
         env:
+        - name: MODE
+          value: "client"
         - name: NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
         - name: SERVER_ADDR
           valueFrom:
             secretKeyRef:
@@ -100,6 +109,16 @@ spec:
             configMapKeyRef:
               name: mesh-client-config
               key: dial_only
+        - name: RELAY_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: relay_server
+        - name: RELAY_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mesh-client-config
+              key: relay_port
         volumeMounts:
         - name: tinc-etc
           mountPath: /etc/tinc/mesh

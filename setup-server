@@ -3,11 +3,12 @@ set -euo pipefail
 
 # VLESS Reality (PQ-capable) + Tinc hub server
 # Usage: setup-server --mesh-ip 10.10.0.1 --pub-addr 1.2.3.4 [--vless-port 443] [--tinc-port 6060] [--mtu 1400]
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
 cat <<'EOF'
 setup-server --mesh-ip IP --pub-addr ADDR [options]
-  --mesh-ip IP         Mesh /24 address of server (required)
+  --mesh-ip IP         Mesh /24 address of server (default auto from host IP; supports "auto")
   --pub-addr ADDR      Public IP/DNS clients reach (required)
   --vless-port PORT    VLESS listen port (default 443)
   --tinc-port PORT     Tinc TCP port (default 6060)
@@ -18,6 +19,9 @@ setup-server --mesh-ip IP --pub-addr ADDR [options]
   --registry-token TOK Pre-shared token (default generate)
   --deploy MODE        host|compose|k8s|container (default host)
   --image-registry R/  Registry prefix for container image (e.g. registry:443/) for compose/k8s
+  --k8s-clients        Install mesh client DaemonSet (default auto if kubectl is present)
+  --no-k8s-clients     Disable auto DaemonSet install
+  --no-kubelet-node-ip Do not set kubelet --node-ip to mesh IP
   -h                   help
 EOF
 }
@@ -27,14 +31,138 @@ need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 ensure_docker(){ command -v docker >/dev/null || { echo "docker is required for --deploy compose/k8s"; exit 1; }; }
 ensure_kubectl(){ command -v kubectl >/dev/null || { echo "kubectl is required for --deploy k8s"; exit 1; }; }
 
+k(){ env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy kubectl "$@"; }
+
+detect_host_ip() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+detect_default_iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+detect_iptables_bin() {
+  local out=""
+  if command -v iptables >/dev/null 2>&1; then
+    out="$(iptables -t nat -S 2>&1 || true)"
+    if echo "$out" | grep -q "iptables-legacy tables present"; then
+      if command -v iptables-legacy >/dev/null 2>&1; then
+        echo "iptables-legacy"
+        return 0
+      fi
+    fi
+    if [[ -n "$out" && ! "$out" =~ Incompatible\ with\ this\ kernel ]]; then
+      echo "iptables"
+      return 0
+    fi
+  fi
+  if command -v iptables-legacy >/dev/null 2>&1; then
+    echo "iptables-legacy"
+    return 0
+  fi
+  return 1
+}
+
+set_kubelet_node_ip() {
+  local mesh_ip="$1"
+  local kubelet_file="/etc/default/kubelet"
+  local tmp_file=""
+  local updated=0
+
+  if [[ -z "${mesh_ip}" ]]; then
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! systemctl list-unit-files kubelet.service >/dev/null 2>&1; then
+    return 0
+  fi
+
+  tmp_file="$(mktemp)"
+  if [[ -f "${kubelet_file}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      if [[ "${line}" == KUBELET_EXTRA_ARGS=* ]]; then
+        local raw="${line#KUBELET_EXTRA_ARGS=}"
+        raw="${raw%\"}"
+        raw="${raw#\"}"
+        raw="$(printf '%s' "${raw}" | sed -E 's/--node-ip=[^ ]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+        if [[ -n "${raw}" ]]; then
+          printf 'KUBELET_EXTRA_ARGS="%s --node-ip=%s"\n' "${raw}" "${mesh_ip}" >> "${tmp_file}"
+        else
+          printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' "${mesh_ip}" >> "${tmp_file}"
+        fi
+        updated=1
+      else
+        printf '%s\n' "${line}" >> "${tmp_file}"
+      fi
+    done < "${kubelet_file}"
+  fi
+  if [[ "${updated}" -eq 0 ]]; then
+    printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' "${mesh_ip}" >> "${tmp_file}"
+  fi
+  mv "${tmp_file}" "${kubelet_file}"
+  systemctl daemon-reload
+  systemctl restart kubelet
+}
+
+auto_mesh_ip() {
+  local src_ip="$1"
+  local last_octet=""
+  last_octet="$(printf '%s' "$src_ip" | awk -F. '{print $4}')"
+  if [[ -n "$last_octet" && "$last_octet" =~ ^[0-9]+$ && "$last_octet" -ge 1 && "$last_octet" -le 254 ]]; then
+    echo "10.10.0.${last_octet}"
+  fi
+}
+
+ensure_mesh_egress_nat() {
+  local mesh_cidr="$1"
+  local iface="${2:-}"
+  if [[ -z "${mesh_cidr}" ]]; then
+    return 0
+  fi
+  if [[ -z "${IPTABLES_BIN:-}" ]]; then
+    echo "mesh-nat: iptables missing; skipping" >&2
+    return 0
+  fi
+  if [[ -z "${iface}" ]]; then
+    iface="$(detect_default_iface || true)"
+  fi
+  if [[ -z "${iface}" ]]; then
+    echo "mesh-nat: default interface not found; skipping" >&2
+    return 0
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  fi
+  local chain="MESH_EGRESS"
+  "$IPTABLES_BIN" -t nat -N "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -F "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -A "$chain" -s "$mesh_cidr" -o "$iface" -j MASQUERADE
+  if ! "$IPTABLES_BIN" -t nat -C POSTROUTING -j "$chain" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t nat -A POSTROUTING -j "$chain"
+  fi
+}
+
 write_docker_context() {
   local ctx="/etc/vless-mesh/docker-node"
   mkdir -p "$ctx"
+  if [[ ! -f "$SCRIPT_DIR/setup-client" ]]; then
+    echo "setup-client not found in $SCRIPT_DIR" >&2
+    exit 1
+  fi
+  if [[ ! -f "$SCRIPT_DIR/docker-node/entry.sh" ]]; then
+    echo "docker-node/entry.sh not found in $SCRIPT_DIR" >&2
+    exit 1
+  fi
+  cp "$SCRIPT_DIR/setup-client" "$ctx/setup-client"
+  cp "$SCRIPT_DIR/docker-node/entry.sh" "$ctx/entry.sh"
+  chmod +x "$ctx/setup-client" "$ctx/entry.sh"
   cat >"$ctx/Dockerfile" <<'EOF'
 FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip \
+    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip openssl uuid-runtime procps ipset iptables \
     && mkdir -p /usr/local/share/xray /usr/local/etc/xray \
     && curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
     && unzip /tmp/xray.zip -d /tmp/xray \
@@ -42,26 +170,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && install -m644 /tmp/xray/geoip.dat /usr/local/share/xray/geoip.dat \
     && install -m644 /tmp/xray/geosite.dat /usr/local/share/xray/geosite.dat \
     && rm -rf /var/lib/apt/lists/* /tmp/xray /tmp/xray.zip
+COPY setup-client /usr/local/bin/setup-client
+RUN chmod +x /usr/local/bin/setup-client
 COPY entry.sh /entry.sh
 COPY registry.py /registry.py
 RUN chmod +x /entry.sh
 ENTRYPOINT ["/entry.sh"]
-EOF
-  cat >"$ctx/entry.sh" <<'EOF'
-#!/bin/bash
-set -e
-MODE=${MODE:-server}
-ENABLE_REGISTRY=${ENABLE_REGISTRY:-0}
-ENABLE_IPERF=${ENABLE_IPERF:-1}
-tincd -n mesh -D &
-xray run -c /usr/local/etc/xray/config.json &
-if [ "$ENABLE_REGISTRY" = "1" ]; then
-  python3 /registry.py /etc/vless-mesh/peers.json &
-fi
-if [ "$MODE" = "server" ] && [ "$ENABLE_IPERF" = "1" ]; then
-  iperf3 -s -p 5201 &
-fi
-wait -n
 EOF
   cat >"$ctx/registry.py" <<'EOF'
 #!/usr/bin/env python3
@@ -240,8 +354,169 @@ spec:
 EOF
   echo "$file"
 }
+
+apply_k8s_clients() {
+  local ns="vless-mesh"
+  local image="$IMAGE_TAG"
+  local server_addr="$PUB_ADDR"
+
+  k create ns "$ns" --dry-run=client -o yaml | k apply -f -
+
+  k -n "$ns" create secret generic mesh-client-secret \
+    --from-literal=server_addr="$server_addr" \
+    --from-literal=token="$REG_TOKEN" \
+    --from-literal=mesh_uuid="$MESH_UUID" \
+    --dry-run=client -o yaml | k apply -f -
+
+  k -n "$ns" create configmap mesh-client-config \
+    --from-literal=vless_port="$VLESS_PORT" \
+    --from-literal=tinc_port="$TINC_PORT" \
+    --from-literal=fw_base="17000" \
+    --from-literal=reg_port="$REG_PORT" \
+    --from-literal=reality_dest="$REALITY_DEST" \
+    --from-literal=dial_only="0" \
+    --from-literal=relay_server="1" \
+    --from-literal=relay_port="4443" \
+    --dry-run=client -o yaml | k apply -f -
+
+  cat <<EOF | k apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mesh-client
+  namespace: ${ns}
+  labels:
+    app: vless-mesh-client
+spec:
+  selector:
+    matchLabels:
+      app: vless-mesh-client
+  template:
+    metadata:
+      labels:
+        app: vless-mesh-client
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+      containers:
+        - name: mesh-client
+          image: ${image}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN","NET_RAW"]
+          env:
+            - name: MODE
+              value: "client"
+            - name: NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: SERVER_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-client-secret
+                  key: server_addr
+            - name: MESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-client-secret
+                  key: token
+            - name: MESH_UUID
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-client-secret
+                  key: mesh_uuid
+            - name: VLESS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: vless_port
+            - name: TINC_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: tinc_port
+            - name: FW_BASE
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: fw_base
+            - name: REG_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: reg_port
+            - name: REALITY_DEST
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: reality_dest
+            - name: MESH_DIAL_ONLY
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: dial_only
+            - name: RELAY_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: relay_server
+            - name: RELAY_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: mesh-client-config
+                  key: relay_port
+          volumeMounts:
+            - name: tinc-etc
+              mountPath: /etc/tinc/mesh
+            - name: xray-etc
+              mountPath: /usr/local/etc/xray
+            - name: vless-etc
+              mountPath: /etc/vless-mesh
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: tinc-etc
+          hostPath:
+            path: /etc/tinc/mesh
+            type: DirectoryOrCreate
+        - name: xray-etc
+          hostPath:
+            path: /usr/local/etc/xray
+            type: DirectoryOrCreate
+        - name: vless-etc
+          hostPath:
+            path: /etc/vless-mesh
+            type: DirectoryOrCreate
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+EOF
+}
 MESH_IP=""; PUB_ADDR=""; VLESS_PORT=443; TINC_PORT=6060; MTU=1400; UUID=""; REALITY_DEST="www.microsoft.com:443"; MESH_UUID=""; REG_PORT=9000; REG_TOKEN=""
 DEPLOY="host"; IMAGE_REGISTRY=""
+KUBELET_NODE_IP=1
+INSTALL_K8S_CLIENTS=1; INSTALL_K8S_CLIENTS_SET=0
 HOST_NODE=$(hostname -s)
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -257,11 +532,13 @@ while [[ $# -gt 0 ]]; do
     --uuid) UUID="$2"; shift 2;;
     --deploy) DEPLOY="$2"; shift 2;;
     --image-registry) IMAGE_REGISTRY="$2"; shift 2;;
+    --no-kubelet-node-ip) KUBELET_NODE_IP=0; shift 1;;
+    --k8s-clients) INSTALL_K8S_CLIENTS=1; INSTALL_K8S_CLIENTS_SET=1; shift 1;;
+    --no-k8s-clients) INSTALL_K8S_CLIENTS=0; INSTALL_K8S_CLIENTS_SET=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
   esac
 done
-[[ -n "$MESH_IP" && -n "$PUB_ADDR" ]] || { usage; exit 1; }
 UUID=${UUID:-$(uuidgen)}
 if [[ "$DEPLOY" != "container" ]]; then
   MESH_UUID=${MESH_UUID:-$(uuidgen)}
@@ -277,6 +554,22 @@ fi
 IMAGE_TAG="${IMAGE_REGISTRY}vless-mesh-node:latest"
 
 need_root
+IPTABLES_BIN="$(detect_iptables_bin || true)"
+LAN_IP="$(detect_host_ip || true)"
+LAN_IP="${LAN_IP:-$(hostname -I | awk '{print $1}')}"
+if [[ -z "${MESH_IP}" || "${MESH_IP}" == "auto" ]]; then
+  MESH_IP="$(auto_mesh_ip "${LAN_IP:-}")"
+fi
+if [[ -z "${MESH_IP}" ]]; then
+  echo "Unable to derive --mesh-ip automatically; please pass --mesh-ip explicitly." >&2
+  exit 1
+fi
+[[ -n "$PUB_ADDR" ]] || { usage; exit 1; }
+
+MESH_PREFIX="${MESH_IP%.*}"
+MESH_CIDR="${MESH_PREFIX}.0/24"
+ensure_mesh_egress_nat "$MESH_CIDR"
+
 if [[ "$DEPLOY" == "host" ]]; then
   apt-get update -qq
   apt-get install -yq tinc curl jq python3-cryptography python3 iperf3 >/dev/null
@@ -341,7 +634,6 @@ fi
 
 SHORT_ID=${SHORT_ID:-$(openssl rand -hex 4)}
 DEST_HOST=${REALITY_DEST%%:*}
-LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}' || true)"
 LAN_IP="${LAN_IP:-$(hostname -I | awk '{print $1}')}"
 
 BASE=/etc/tinc/mesh
@@ -388,6 +680,10 @@ $PUBK
 EOF
 
 # Xray: inbound VLESS Reality (PQ-capable), outbound freedom redirect to local tinc
+FALLBACKS=""
+if [[ "${REG_PORT}" != "${VLESS_PORT}" ]]; then
+  FALLBACKS=",\"fallbacks\":[{\"dest\":\"127.0.0.1:${REG_PORT}\"}]"
+fi
 cat >/usr/local/etc/xray/config.json <<EOF
 {
   "log":{"loglevel":"warning"},
@@ -398,8 +694,8 @@ cat >/usr/local/etc/xray/config.json <<EOF
       "port":$VLESS_PORT,
       "protocol":"vless",
       "settings":{
-        "clients":[{"id":"$MESH_UUID","level":0}],
-        "decryption":"none"
+        "clients":[{"id":"$MESH_UUID","level":0,"flow":"xtls-rprx-vision"}],
+        "decryption":"none"$FALLBACKS
       },
       "streamSettings":{
         "network":"tcp",
@@ -431,6 +727,9 @@ echo mesh >/etc/tinc/nets.boot
 if [[ "$DEPLOY" == "host" ]]; then
   systemctl enable --now tinc@mesh
   systemctl enable --now xray
+  if [[ $KUBELET_NODE_IP -eq 1 ]]; then
+    set_kubelet_node_ip "$MESH_IP"
+  fi
 
   # iperf3 server for throughput probing (P2P selection)
   cat >/etc/systemd/system/iperf3-mesh.service <<'EOF'
@@ -729,7 +1028,14 @@ PY
   tincd -n mesh -D &
   xray run -c /usr/local/etc/xray/config.json &
   python3 /usr/local/sbin/mesh-registry.py /etc/vless-mesh/peers.json &
-  iperf3 -s -p 5201 &
+  IPERF_PORT="${IPERF_PORT:-5201}"
+  if [[ "${ENABLE_IPERF:-1}" == "1" ]]; then
+    if ss -lnt | awk '{print $4}' | grep -q ":${IPERF_PORT}$"; then
+      echo "iperf3 port ${IPERF_PORT} already in use; skipping" >&2
+    else
+      iperf3 -s -p "$IPERF_PORT" &
+    fi
+  fi
   wait -n
 
 else
@@ -769,9 +1075,27 @@ EOF
   fi
 fi
 
+K8S_CLIENTS_STATUS="skipped"
+if [[ "${INSTALL_K8S_CLIENTS}" -eq 1 ]]; then
+  if command -v kubectl >/dev/null 2>&1; then
+    if k get nodes >/dev/null 2>&1; then
+      apply_k8s_clients
+      K8S_CLIENTS_STATUS="applied"
+    elif [[ "${INSTALL_K8S_CLIENTS_SET}" -eq 1 ]]; then
+      echo "kubectl is not configured for a cluster; cannot install mesh client DaemonSet." >&2
+      exit 1
+    else
+      echo "kubectl is present but not configured; skipping mesh client DaemonSet." >&2
+    fi
+  elif [[ "${INSTALL_K8S_CLIENTS_SET}" -eq 1 ]]; then
+    echo "kubectl not found; skipping mesh client DaemonSet." >&2
+  fi
+fi
+
 cat <<EOF
 Server ready.
   Public VLESS: $PUB_ADDR:$VLESS_PORT
+  Mesh IP: $MESH_IP
   VLESS UUID (mesh): $MESH_UUID
   Reality public key: $REALITY_PUB
   Reality shortId: $SHORT_ID
@@ -780,5 +1104,6 @@ Server ready.
   Registry: http://$PUB_ADDR:$REG_PORT (token in /etc/vless-mesh/token)
   Tinc host file: /etc/tinc/mesh/hosts/server
   Deploy mode: $DEPLOY (image $IMAGE_TAG)
+  K8s clients: $K8S_CLIENTS_STATUS
 Distribute the host file, mesh UUID, registry token to clients.
 EOF

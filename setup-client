@@ -10,7 +10,7 @@ set -euo pipefail
 usage(){ cat <<'H'
 setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --server-addr IP       Registry/VLESS peer address (required)
-  --mesh-ip IP           Mesh /24 IP of this node (required)
+  --mesh-ip IP           Mesh /24 IP of this node (default auto from host IP; supports "auto")
   --token TOKEN          Registry token (required)
   --name NAME            tinc node name (default hostname)
   --pub-addr ADDR        Public/DNS peers use to reach this node (default first IP)
@@ -23,14 +23,341 @@ setup-client --server-addr IP --mesh-ip IP --token TOKEN [options]
   --reality-dest H:P     Reality dest/SNI (default www.microsoft.com:443)
   --dial-only            Only outbound VLESS (for NAT); do not accept inbound
   --top-peers N          For dial-only: keep top N peers by iperf3 (default 2)
+  --relay-server         Relay non-peer VLESS traffic to server (default on)
+  --no-relay-server      Disable VLESS relay
+  --relay-port PORT      Local relay listen port (default 4443)
   --deploy MODE          host|docker|compose|k8s (default host)
+  --no-kubelet-node-ip   Do not set kubelet --node-ip to mesh IP
   --refresh-only         Only refresh configs (use saved config)
   -h                     Help
 H
 }
 
+APT_FLAGS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
 need_root(){ [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }; }
 ensure_docker(){ command -v docker >/dev/null || { echo "docker is required for --deploy docker/compose"; exit 1; }; }
+
+detect_host_ip() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+detect_default_iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+detect_iptables_bin() {
+  local out=""
+  if command -v iptables >/dev/null 2>&1; then
+    out="$(iptables -t nat -S 2>&1 || true)"
+    if echo "$out" | grep -q "iptables-legacy tables present"; then
+      if command -v iptables-legacy >/dev/null 2>&1; then
+        echo "iptables-legacy"
+        return 0
+      fi
+    fi
+    if [[ -n "$out" && ! "$out" =~ Incompatible\ with\ this\ kernel ]]; then
+      echo "iptables"
+      return 0
+    fi
+  fi
+  if command -v iptables-legacy >/dev/null 2>&1; then
+    echo "iptables-legacy"
+    return 0
+  fi
+  return 1
+}
+
+set_kubelet_node_ip() {
+  local mesh_ip="$1"
+  local kubelet_file="/etc/default/kubelet"
+  local tmp_file=""
+  local updated=0
+
+  if [[ -z "${mesh_ip}" ]]; then
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! systemctl list-unit-files kubelet.service >/dev/null 2>&1; then
+    return 0
+  fi
+
+  tmp_file="$(mktemp)"
+  if [[ -f "${kubelet_file}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      if [[ "${line}" == KUBELET_EXTRA_ARGS=* ]]; then
+        local raw="${line#KUBELET_EXTRA_ARGS=}"
+        raw="${raw%\"}"
+        raw="${raw#\"}"
+        raw="$(printf '%s' "${raw}" | sed -E 's/--node-ip=[^ ]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+        if [[ -n "${raw}" ]]; then
+          printf 'KUBELET_EXTRA_ARGS="%s --node-ip=%s"\n' "${raw}" "${mesh_ip}" >> "${tmp_file}"
+        else
+          printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' "${mesh_ip}" >> "${tmp_file}"
+        fi
+        updated=1
+      else
+        printf '%s\n' "${line}" >> "${tmp_file}"
+      fi
+    done < "${kubelet_file}"
+  fi
+  if [[ "${updated}" -eq 0 ]]; then
+    printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' "${mesh_ip}" >> "${tmp_file}"
+  fi
+  mv "${tmp_file}" "${kubelet_file}"
+  systemctl daemon-reload
+  systemctl restart kubelet
+}
+
+auto_mesh_ip() {
+  local src_ip="$1"
+  local last_octet=""
+  last_octet="$(printf '%s' "$src_ip" | awk -F. '{print $4}')"
+  if [[ -n "$last_octet" && "$last_octet" =~ ^[0-9]+$ && "$last_octet" -ge 1 && "$last_octet" -le 254 ]]; then
+    echo "10.10.0.${last_octet}"
+  fi
+}
+
+pick_pub_addr() {
+  local mesh_prefix="$1"
+  local ip_list=""
+  ip_list="$(hostname -I 2>/dev/null || true)"
+  if [[ -n "${mesh_prefix}" ]]; then
+    for ip in $ip_list; do
+      if [[ "${ip}" != "${mesh_prefix}."* ]]; then
+        echo "${ip}"
+        return
+      fi
+    done
+  fi
+  echo "${ip_list}" | awk '{print $1}'
+}
+
+write_tcp_relay() {
+  local script="$1"
+  cat >"$script" <<'PY'
+#!/usr/bin/env python3
+import socket
+import socketserver
+import threading
+import sys
+
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = int(sys.argv[1])
+TARGET_HOST = sys.argv[2]
+TARGET_PORT = int(sys.argv[3])
+
+def pipe(src, dst):
+  try:
+    while True:
+      data = src.recv(65535)
+      if not data:
+        break
+      dst.sendall(data)
+  except Exception:
+    pass
+  finally:
+    for s in (src, dst):
+      try:
+        s.shutdown(socket.SHUT_RDWR)
+      except Exception:
+        pass
+      try:
+        s.close()
+      except Exception:
+        pass
+
+class ProxyHandler(socketserver.BaseRequestHandler):
+  def handle(self):
+    try:
+      upstream = socket.create_connection((TARGET_HOST, TARGET_PORT), timeout=5)
+    except Exception:
+      return
+    t1 = threading.Thread(target=pipe, args=(self.request, upstream), daemon=True)
+    t2 = threading.Thread(target=pipe, args=(upstream, self.request), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+  allow_reuse_address = True
+  daemon_threads = True
+
+def main():
+  with ThreadedTCPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler) as srv:
+    srv.serve_forever()
+
+if __name__ == "__main__":
+  main()
+PY
+  chmod +x "$script"
+}
+
+write_registry_relay() {
+  local server_mesh_ip="$1"
+  local listen_port="$2"
+  local target_port="$3"
+  local script="/usr/local/sbin/mesh-registry-relay.py"
+  write_tcp_relay "$script"
+}
+
+update_ipset_from_peers() {
+  local peers_json="$1"
+  local set_name="$2"
+  ipset create "$set_name" hash:ip -exist >/dev/null 2>&1 || true
+  ipset flush "$set_name" >/dev/null 2>&1 || true
+  python3 - "$peers_json" "$set_name" <<'PY'
+import json
+import socket
+import subprocess
+import sys
+
+peers_path = sys.argv[1]
+set_name = sys.argv[2]
+
+def add_ip(ip):
+    subprocess.run(["ipset", "add", set_name, ip, "-exist"], check=False)
+
+def resolve(host):
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        return sorted({info[4][0] for info in infos})
+    except Exception:
+        return []
+
+try:
+    with open(peers_path) as f:
+        data = json.load(f)
+except Exception:
+    data = {"peers": []}
+
+for peer in data.get("peers", []):
+    addr = (peer.get("pub_addr") or "").strip()
+    if not addr:
+        continue
+    if addr.count(".") == 3:
+        add_ip(addr)
+        continue
+    for ip in resolve(addr):
+        add_ip(ip)
+PY
+}
+
+configure_vless_relay() {
+  if [[ "${RELAY_SERVER}" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "${RELAY_PORT}" == "${VLESS_PORT}" ]]; then
+    echo "relay: relay_port must differ from vless_port; skipping" >&2
+    return 0
+  fi
+  if [[ -z "${IPTABLES_BIN:-}" ]] || ! command -v ipset >/dev/null 2>&1; then
+    echo "relay: iptables/ipset missing; skipping" >&2
+    return 0
+  fi
+  local peers_json="/etc/vless-mesh/peers.json"
+  if [[ ! -f "$peers_json" ]]; then
+    echo "relay: peers.json missing; skipping" >&2
+    return 0
+  fi
+
+  local server_mesh_ip=""
+  server_mesh_ip="$(jq -r '.peers[] | select(.name=="server") | .mesh_ip // empty' "$peers_json" 2>/dev/null || true)"
+  local relay_target="${server_mesh_ip:-$SERVER_ADDR}"
+  if [[ -z "${relay_target}" ]]; then
+    echo "relay: server address missing; skipping" >&2
+    return 0
+  fi
+
+  local set_name="vless_mesh_peers"
+  update_ipset_from_peers "$peers_json" "$set_name"
+
+  local chain="VLESS_MESH_RELAY"
+  "$IPTABLES_BIN" -t nat -N "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -F "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -A "$chain" -p tcp --dport "$VLESS_PORT" -m addrtype --dst-type LOCAL \
+    -m set ! --match-set "$set_name" src -j REDIRECT --to-ports "$RELAY_PORT"
+  if ! "$IPTABLES_BIN" -t nat -C PREROUTING -j "$chain" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t nat -A PREROUTING -j "$chain"
+  fi
+
+  local relay_script="/usr/local/sbin/mesh-vless-relay.py"
+  write_tcp_relay "$relay_script"
+
+  if [[ "$DEPLOY" == "host" ]]; then
+    cat >/etc/systemd/system/mesh-vless-relay.service <<EOF
+[Unit]
+Description=VLESS mesh relay to server
+After=network.target
+
+[Service]
+ExecStart=${relay_script} ${RELAY_PORT} ${relay_target} ${VLESS_PORT}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now mesh-vless-relay.service
+    systemctl restart mesh-vless-relay.service
+  elif [[ "$DEPLOY" == "k8s" ]]; then
+    if ! pgrep -f "mesh-vless-relay.py ${RELAY_PORT}" >/dev/null 2>&1; then
+      python3 "${relay_script}" "${RELAY_PORT}" "${relay_target}" "${VLESS_PORT}" &
+    fi
+  fi
+}
+
+ensure_mesh_egress_nat() {
+  local mesh_cidr="$1"
+  local iface="${2:-}"
+  if [[ -z "${mesh_cidr}" ]]; then
+    return 0
+  fi
+  if [[ -z "${IPTABLES_BIN:-}" ]]; then
+    echo "mesh-nat: iptables missing; skipping" >&2
+    return 0
+  fi
+  if [[ -z "${iface}" ]]; then
+    iface="$(detect_default_iface || true)"
+  fi
+  if [[ -z "${iface}" ]]; then
+    echo "mesh-nat: default interface not found; skipping" >&2
+    return 0
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  fi
+  local chain="MESH_EGRESS"
+  "$IPTABLES_BIN" -t nat -N "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -F "$chain" >/dev/null 2>&1 || true
+  "$IPTABLES_BIN" -t nat -A "$chain" -s "$mesh_cidr" -o "$iface" -j MASQUERADE
+  if ! "$IPTABLES_BIN" -t nat -C POSTROUTING -j "$chain" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t nat -A POSTROUTING -j "$chain"
+  fi
+}
+
+disable_vless_relay() {
+  local chain="VLESS_MESH_RELAY"
+  if [[ -n "${IPTABLES_BIN:-}" ]]; then
+    "$IPTABLES_BIN" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1 || true
+    "$IPTABLES_BIN" -t nat -F "$chain" >/dev/null 2>&1 || true
+    "$IPTABLES_BIN" -t nat -X "$chain" >/dev/null 2>&1 || true
+  fi
+  if command -v ipset >/dev/null 2>&1; then
+    ipset destroy vless_mesh_peers >/dev/null 2>&1 || true
+  fi
+  if [[ "$DEPLOY" == "host" ]]; then
+    systemctl disable --now mesh-vless-relay.service >/dev/null 2>&1 || true
+  elif [[ "$DEPLOY" == "k8s" ]]; then
+    pkill -f "/usr/local/sbin/mesh-vless-relay.py" >/dev/null 2>&1 || true
+  fi
+}
 
 write_docker_context() {
   local ctx="/etc/vless-mesh/docker-node"
@@ -42,7 +369,7 @@ write_docker_context() {
 FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip \
+    tinc iproute2 python3 python3-cryptography jq curl iperf3 ca-certificates unzip ipset iptables \
     && mkdir -p /usr/local/share/xray /usr/local/etc/xray \
     && curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
     && unzip /tmp/xray.zip -d /tmp/xray \
@@ -104,8 +431,11 @@ VLESS_PORT=443; TINC_PORT=6060; FW_BASE=7000; MTU=1400; MESH_UUID="";
 VLESS_PORT_SET=0; TINC_PORT_SET=0; FW_BASE_SET=0; MTU_SET=0; MESH_UUID_SET=0;
 REG_PORT=9000; REALITY_DEST="www.microsoft.com:443"; REFRESH_ONLY=0; DIAL_ONLY=0; TOP_PEERS=2
 REG_PORT_SET=0; REALITY_DEST_SET=0; DIAL_ONLY_SET=0; TOP_PEERS_SET=0;
+RELAY_SERVER=1; RELAY_PORT=4443
+RELAY_SERVER_SET=0; RELAY_PORT_SET=0
 DEPLOY="host"
 DEPLOY_SET=0
+KUBELET_NODE_IP=1
 XRAY_CONFIG=""
 
 while [[ $# -gt 0 ]]; do
@@ -124,7 +454,11 @@ while [[ $# -gt 0 ]]; do
     --reality-dest) REALITY_DEST="$2"; REALITY_DEST_SET=1; shift 2;;
     --dial-only) DIAL_ONLY=1; DIAL_ONLY_SET=1; shift 1;;
     --top-peers) TOP_PEERS="$2"; TOP_PEERS_SET=1; shift 2;;
+    --relay-server) RELAY_SERVER=1; RELAY_SERVER_SET=1; shift 1;;
+    --no-relay-server) RELAY_SERVER=0; RELAY_SERVER_SET=1; shift 1;;
+    --relay-port) RELAY_PORT="$2"; RELAY_PORT_SET=1; shift 2;;
     --deploy) DEPLOY="$2"; DEPLOY_SET=1; shift 2;;
+    --no-kubelet-node-ip) KUBELET_NODE_IP=0; shift 1;;
     --refresh-only) REFRESH_ONLY=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown $1"; usage; exit 1;;
@@ -137,6 +471,7 @@ case "$DEPLOY" in
 esac
 
 need_root
+IPTABLES_BIN="$(detect_iptables_bin || true)"
 CONFIG_JSON=/etc/vless-mesh/config.json
 SELF_JSON=/etc/vless-mesh/self.json
 
@@ -154,22 +489,61 @@ if [[ -f $CONFIG_JSON ]]; then
   [[ $REALITY_DEST_SET -eq 0 ]] && REALITY_DEST=$(jq -r '.reality_dest' $CONFIG_JSON)
   [[ $TOP_PEERS_SET -eq 0 ]] && TOP_PEERS=$(jq -r '.top_peers // 2' $CONFIG_JSON)
   [[ $DIAL_ONLY_SET -eq 0 ]] && DIAL_ONLY=$(jq -r '.dial_only // 0' $CONFIG_JSON)
+  [[ $RELAY_SERVER_SET -eq 0 ]] && RELAY_SERVER=$(jq -r '.relay_server // 1' $CONFIG_JSON)
+  [[ $RELAY_PORT_SET -eq 0 ]] && RELAY_PORT=$(jq -r '.relay_port // 4443' $CONFIG_JSON)
 fi
 
+case "$RELAY_SERVER" in
+  true) RELAY_SERVER=1;;
+  false) RELAY_SERVER=0;;
+esac
+
+HOST_IP="$(detect_host_ip || true)"
+HOST_IP="${HOST_IP:-$(hostname -I | awk '{print $1}')}"
+
 if [[ $REFRESH_ONLY -eq 0 ]]; then
-  [[ -n "$SERVER_ADDR" && -n "$MESH_IP" && -n "$TOKEN" ]] || { usage; exit 1; }
+  [[ -n "$SERVER_ADDR" && -n "$TOKEN" ]] || { usage; exit 1; }
+  if [[ -z "${MESH_IP}" || "${MESH_IP}" == "auto" ]]; then
+    MESH_IP="$(auto_mesh_ip "${HOST_IP:-}")"
+  fi
+  if [[ -z "${MESH_IP}" ]]; then
+    echo "Unable to derive --mesh-ip automatically; please pass --mesh-ip explicitly." >&2
+    exit 1
+  fi
   if [[ "$DEPLOY" == "host" ]]; then
     apt-get update -qq
-    apt-get install -yq tinc curl jq python3 python3-cryptography iperf3 openssl uuid-runtime >/dev/null
+    apt-get install -yq "${APT_FLAGS[@]}" tinc curl jq python3 python3-cryptography iperf3 openssl uuid-runtime ipset iptables >/dev/null
     command -v xray >/dev/null || bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1
   fi
 else
   [[ -n "$SERVER_ADDR" ]] || { echo "refresh: server_addr missing"; exit 1; }
+  if [[ -z "${MESH_IP}" || "${MESH_IP}" == "auto" ]]; then
+    MESH_IP="$(auto_mesh_ip "${HOST_IP:-}")"
+  fi
 fi
+if [[ -z "${MESH_IP}" ]]; then
+  echo "mesh_ip missing; rerun setup-client with --mesh-ip." >&2
+  exit 1
+fi
+
+SERVER_ADDR_RAW="$SERVER_ADDR"
+SERVER_ADDR_ACTIVE=""
+SERVER_ADDR_LIST=()
+SERVER_ADDR_LIST_CLEAN=()
+IFS=',' read -r -a SERVER_ADDR_LIST <<< "$SERVER_ADDR_RAW"
+for addr in "${SERVER_ADDR_LIST[@]}"; do
+  addr="${addr// /}"
+  if [[ -n "$addr" ]]; then
+    SERVER_ADDR_LIST_CLEAN+=("$addr")
+  fi
+done
+SERVER_ADDR_LIST=("${SERVER_ADDR_LIST_CLEAN[@]}")
 
 NAME=${NAME:-$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')}
 NAME="$(printf '%s' "${NAME}" | sed 's/[^A-Za-z0-9]/_/g')"
-PUB_ADDR=${PUB_ADDR:-$(hostname -I | awk '{print $1}')}
+MESH_PREFIX="${MESH_IP%.*}"
+PUB_ADDR=${PUB_ADDR:-$(pick_pub_addr "${MESH_PREFIX}")}
+PUB_ADDR=${PUB_ADDR:-${HOST_IP:-}}
 DEST_HOST=${REALITY_DEST%%:*}
 if [[ -z "${XRAY_CONFIG:-}" ]]; then
   if [[ "$DEPLOY" == "host" ]]; then
@@ -261,13 +635,48 @@ EOF
 HOST_B64=$(base64 -w0 "$SELF_HOST")
 
 # registry
-PEERS_URL="http://$SERVER_ADDR:$REG_PORT/peers"
-REG_URL="http://$SERVER_ADDR:$REG_PORT/register"
 TMP=$(mktemp)
-if curl -fsS -H "X-Mesh-Token: $TOKEN" "$PEERS_URL" -o "$TMP"; then
-  EXIST_UUID=$(jq -r '.uuid // empty' "$TMP")
-  [[ -n "$EXIST_UUID" ]] && MESH_UUID=${MESH_UUID:-$EXIST_UUID}
+
+REG_BASE=""
+PEERS_URL=""
+REG_URL=""
+
+try_registry() {
+  local base="$1"
+  if curl -fsS -H "X-Mesh-Token: $TOKEN" "${base}/peers" -o "$TMP"; then
+    REG_BASE="$base"
+    PEERS_URL="${REG_BASE}/peers"
+    REG_URL="${REG_BASE}/register"
+    return 0
+  fi
+  return 1
+}
+
+for addr in "${SERVER_ADDR_LIST[@]}"; do
+  if try_registry "http://${addr}:${REG_PORT}"; then
+    SERVER_ADDR_ACTIVE="$addr"
+    break
+  fi
+  if [[ "$REG_PORT" != "$VLESS_PORT" ]]; then
+    if try_registry "http://${addr}:${VLESS_PORT}"; then
+      SERVER_ADDR_ACTIVE="$addr"
+      break
+    fi
+  fi
+done
+
+if [[ -z "${SERVER_ADDR_ACTIVE}" ]]; then
+  if [[ "${REG_PORT}" != "${VLESS_PORT}" ]]; then
+    echo "Registry unreachable for server_addr list: ${SERVER_ADDR_RAW} (ports ${REG_PORT}, ${VLESS_PORT})" >&2
+  else
+    echo "Registry unreachable for server_addr list: ${SERVER_ADDR_RAW} (port ${REG_PORT})" >&2
+  fi
+  exit 1
 fi
+SERVER_ADDR="${SERVER_ADDR_ACTIVE}"
+
+EXIST_UUID=$(jq -r '.uuid // empty' "$TMP" 2>/dev/null || true)
+[[ -n "$EXIST_UUID" ]] && MESH_UUID=${MESH_UUID:-$EXIST_UUID}
 [[ -n "$MESH_UUID" ]] || MESH_UUID=$(uuidgen)
 
 cat >"$TMP" <<EOF
@@ -305,7 +714,7 @@ cat >"$SELF_JSON" <<EOF
 EOF
 cat >"$CONFIG_JSON" <<EOF
 {
-  "server_addr":"$SERVER_ADDR",
+  "server_addr":"$SERVER_ADDR_RAW",
   "mesh_ip":"$MESH_IP",
   "pub_addr":"$PUB_ADDR",
   "token":"$TOKEN",
@@ -316,7 +725,9 @@ cat >"$CONFIG_JSON" <<EOF
   "reg_port":$REG_PORT,
   "reality_dest":"$REALITY_DEST",
   "dial_only":$DIAL_ONLY,
-  "top_peers":$TOP_PEERS
+  "top_peers":$TOP_PEERS,
+  "relay_server":$RELAY_SERVER,
+  "relay_port":$RELAY_PORT
 }
 EOF
 
@@ -324,16 +735,21 @@ EOF
 build_from_peers() {
   local peers_path="$1"
   NAME="$NAME" MESH_UUID="$MESH_UUID" REALITY_PRIV="$REALITY_PRIV" REALITY_PUB="$REALITY_PUB" SHORT_ID="$SHORT_ID" DEST_HOST="$DEST_HOST" \
-  VLESS_PORT="$VLESS_PORT" TINC_PORT="$TINC_PORT" FW_BASE="$FW_BASE" BASE="$BASE" SELF_PUB="$PUB_ADDR" \
+  VLESS_PORT="$VLESS_PORT" TINC_PORT="$TINC_PORT" FW_BASE="$FW_BASE" REG_PORT="$REG_PORT" BASE="$BASE" SELF_PUB="$PUB_ADDR" \
   XRAY_CONFIG="$XRAY_CONFIG" \
   python3 - "$peers_path" <<'PY'
-import sys, json, base64, os, ipaddress
+import sys, json, base64, os, ipaddress, socket
 peers_path=sys.argv[1]
-name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); base_dir=os.environ['BASE']; self_pub=os.environ['SELF_PUB']
+name=os.environ['NAME']; mesh_uuid=os.environ['MESH_UUID']; r_priv=os.environ['REALITY_PRIV']; r_pub=os.environ['REALITY_PUB']; short_id=os.environ['SHORT_ID']; dest_host=os.environ['DEST_HOST']; vless_port=int(os.environ['VLESS_PORT']); tinc_port=int(os.environ['TINC_PORT']); fw_base=int(os.environ['FW_BASE']); reg_port=int(os.environ.get('REG_PORT','9000')); base_dir=os.environ['BASE']; self_pub=os.environ['SELF_PUB']
 xray_cfg=os.environ.get('XRAY_CONFIG','/usr/local/etc/xray/config.json')
 hosts_dir=os.path.join(base_dir,'hosts')
 with open(peers_path) as f: data=json.load(f)
 peers=sorted(data.get('peers',[]), key=lambda p:p['name'])
+server_mesh_ip=None
+for p in peers:
+    if p.get('name')=='server':
+        server_mesh_ip=p.get('mesh_ip') or p.get('pub_addr')
+        break
 
 local_net=None
 try:
@@ -343,7 +759,17 @@ try:
 except Exception:
     pass
 
-inbounds=[{"tag":"vless-in","listen":"0.0.0.0","port":vless_port,"protocol":"vless","settings":{"clients":[{"id":mesh_uuid,"level":0}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":False,"dest":dest_host if ':' in dest_host else f"{dest_host}:443","serverNames":[dest_host],"privateKey":r_priv,"shortIds":[short_id],"fingerprint":"chrome"}}}]
+def can_direct(addr, port, timeout=0.4):
+    try:
+        with socket.create_connection((addr, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+settings={"clients":[{"id":mesh_uuid,"level":0,"flow":"xtls-rprx-vision"}],"decryption":"none"}
+if server_mesh_ip:
+    settings["fallbacks"]=[{"dest":f"{server_mesh_ip}:{reg_port}"}]
+inbounds=[{"tag":"vless-in","listen":"0.0.0.0","port":vless_port,"protocol":"vless","settings":settings,"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":False,"dest":dest_host if ':' in dest_host else f"{dest_host}:443","serverNames":[dest_host],"privateKey":r_priv,"shortIds":[short_id],"fingerprint":"chrome"}}}]
 
 outbounds=[{"tag":"direct","protocol":"freedom"},{"tag":"to-tinc","protocol":"freedom","settings":{"redirect":f"127.0.0.1:{tinc_port}"}}]
 routes=[{"type":"field","inboundTag":["vless-in"],"outboundTag":"to-tinc"}]
@@ -363,6 +789,10 @@ for p in peers:
                 use_direct=True
         except Exception:
             pass
+    if not use_direct:
+        peer_port=int(p.get('tinc_port',tinc_port))
+        if peer_pub and can_direct(peer_pub, peer_port):
+            use_direct=True
 
     if use_direct:
         raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
@@ -379,7 +809,7 @@ for p in peers:
         port=fw_base+idx_vless; idx_vless+=1
         # dokodemo-door needs an explicit destination; the server side will redirect to tinc anyway
         inbounds.append({"tag":f"in-{p['name']}","listen":"127.0.0.1","port":port,"protocol":"dokodemo-door","settings":{"network":"tcp","address":"127.0.0.1","port":int(p.get('tinc_port',tinc_port))}})
-        outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":peer_pub,"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
+        outbounds.append({"tag":f"out-{p['name']}","protocol":"vless","settings":{"vnext":[{"address":peer_pub,"port":int(p['vless_port']),"users":[{"id":mesh_uuid,"encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":p['reality_pub'],"shortId":p['short_id'],"serverName":p.get('sni',dest_host),"fingerprint":"chrome"}}})
         routes.append({"type":"field","inboundTag":[f"in-{p['name']}"],"outboundTag":f"out-{p['name']}"} )
         raw=base64.b64decode(p['host_b64']); text=raw.decode(errors='ignore')
         rsa_lines=[]; grab=False
@@ -435,6 +865,15 @@ fi
 
 build_from_peers "$PEERS_FOR_BUILD"
 
+MESH_CIDR="${MESH_PREFIX}.0/24"
+ensure_mesh_egress_nat "$MESH_CIDR"
+
+if [[ "${RELAY_SERVER}" -eq 1 ]]; then
+  configure_vless_relay
+else
+  disable_vless_relay
+fi
+
 echo mesh >/etc/tinc/nets.boot
 
 if [[ "$DEPLOY" == "host" ]]; then
@@ -456,6 +895,9 @@ EOF
   systemctl restart vless-mesh-xray.service
   systemctl enable --now tinc@mesh
   systemctl restart tinc@mesh
+  if [[ $REFRESH_ONLY -eq 0 && $KUBELET_NODE_IP -eq 1 ]]; then
+    set_kubelet_node_ip "$MESH_IP"
+  fi
 
   # If the server publishes a LAN/internal IP, route it via mesh.
   # This is needed when the Kubernetes "kubernetes" Service Endpoint points to the server LAN IP.
@@ -464,6 +906,24 @@ EOF
   if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
     for _ in {1..10}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
     ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SERVER_MESH_IP}" && "${SERVER_MESH_IP}" != "${MESH_IP}" && "${REG_PORT}" != "${VLESS_PORT}" ]]; then
+    write_registry_relay "${SERVER_MESH_IP}" "${REG_PORT}" "${REG_PORT}"
+    cat >/etc/systemd/system/mesh-registry-relay.service <<EOF
+[Unit]
+Description=Mesh registry relay
+After=network.target
+
+[Service]
+ExecStart=/usr/local/sbin/mesh-registry-relay.py ${REG_PORT} ${SERVER_MESH_IP} ${REG_PORT}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now mesh-registry-relay.service
   fi
 
   if [[ $REFRESH_ONLY -eq 0 ]]; then
@@ -487,6 +947,10 @@ EOF
     fi
 
     # mesh-refresh calls this script with --refresh-only
+    if [[ "$DEPLOY" == "host" ]]; then
+      SELF_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+      install -m 0755 "$SELF_PATH" /usr/local/bin/setup-client
+    fi
     cat >/usr/local/sbin/mesh-refresh.sh <<'REF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -530,13 +994,12 @@ elif [[ "$DEPLOY" == "k8s" ]]; then
   fi
 
   marker="/etc/vless-mesh/managed-by-k8s"
-  if [[ -f "${marker}" ]]; then
-    ip link del mesh0 >/dev/null 2>&1 || true
-  else
-    if ip link show mesh0 >/dev/null 2>&1; then
-      echo "mesh0 exists but is not managed by this DaemonSet; refusing to override. Sleeping."
-      sleep infinity
+  if ip link show mesh0 >/dev/null 2>&1; then
+    if [[ ! -f "${marker}" ]]; then
+      echo "mesh0 exists but is not managed by this DaemonSet; taking over." >&2
     fi
+    pkill -f "tincd -n mesh" >/dev/null 2>&1 || true
+    ip link del mesh0 >/dev/null 2>&1 || true
   fi
 
   echo "managed-by-k8s $(date -u +%FT%TZ)" >"${marker}" 2>/dev/null || true
@@ -552,6 +1015,10 @@ elif [[ "$DEPLOY" == "k8s" ]]; then
   if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
     for _ in {1..20}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
     ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SERVER_MESH_IP}" && "${SERVER_MESH_IP}" != "${MESH_IP}" && "${REG_PORT}" != "${VLESS_PORT}" ]]; then
+    write_registry_relay "${SERVER_MESH_IP}" "${REG_PORT}" "${REG_PORT}"
+    python3 /usr/local/sbin/mesh-registry-relay.py "${REG_PORT}" "${SERVER_MESH_IP}" "${REG_PORT}" &
   fi
 
   if [[ $DIAL_ONLY -eq 0 ]]; then
@@ -602,7 +1069,8 @@ Client ready.
   Name: $NAME
   Mesh IP: $MESH_IP
   Mesh UUID: $MESH_UUID
-  Registry: http://$SERVER_ADDR:$REG_PORT (token required)
+  Registry: $REG_BASE (token required)
   Dial-only: $DIAL_ONLY (top peers: $TOP_PEERS)
+  Relay: $RELAY_SERVER (port $RELAY_PORT)
   Deploy mode: $DEPLOY
 EOF
