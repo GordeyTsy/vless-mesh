@@ -114,6 +114,7 @@ Run `setup-client` once on the new node with its mesh IP (or `auto`), pub-addr, 
 
 ## Kubernetes auto clients
 When `setup-server` runs on a control-plane with `kubectl`, it also creates the `vless-mesh` namespace, `mesh-client` secret/configmap, and applies a DaemonSet to all non-control-plane nodes. It also updates kubelet `--node-ip` to the mesh IP by default (use `--no-kubelet-node-ip` to skip). Set `--image-registry registry:443/` to point the DaemonSet at your in-cluster registry.
+If you run a node in `--deploy host` mode (host-level mesh services) and want to keep the DaemonSet off that node, label it `vless-mesh=host`. The DaemonSet's node affinity skips nodes with that label.
 
 ## Troubleshooting
 - No ping / “unknown identity”: run `--refresh-only` to regenerate hosts; ensure token/mesh UUID correct.
