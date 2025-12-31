@@ -137,6 +137,46 @@ pick_pub_addr() {
   echo "${ip_list}" | awk '{print $1}'
 }
 
+same_private_24() {
+  local ip1="$1"
+  local ip2="$2"
+  python3 - "$ip1" "$ip2" <<'PY'
+import ipaddress
+import sys
+
+ip1 = sys.argv[1]
+ip2 = sys.argv[2]
+try:
+    a = ipaddress.ip_address(ip1)
+    b = ipaddress.ip_address(ip2)
+except Exception:
+    print("no")
+    raise SystemExit(0)
+
+if not (a.is_private and b.is_private):
+    print("no")
+    raise SystemExit(0)
+
+net = ipaddress.ip_network(f"{ip1}/24", strict=False)
+print("yes" if b in net else "no")
+PY
+}
+
+is_private_ip() {
+  local ip="$1"
+  python3 - "$ip" <<'PY'
+import ipaddress
+import sys
+
+try:
+    addr = ipaddress.ip_address(sys.argv[1])
+except Exception:
+    print("no")
+    raise SystemExit(0)
+print("yes" if addr.is_private else "no")
+PY
+}
+
 write_tcp_relay() {
   local script="$1"
   cat >"$script" <<'PY'
@@ -526,19 +566,6 @@ if [[ -z "${MESH_IP}" ]]; then
   exit 1
 fi
 
-SERVER_ADDR_RAW="$SERVER_ADDR"
-SERVER_ADDR_ACTIVE=""
-SERVER_ADDR_LIST=()
-SERVER_ADDR_LIST_CLEAN=()
-IFS=',' read -r -a SERVER_ADDR_LIST <<< "$SERVER_ADDR_RAW"
-for addr in "${SERVER_ADDR_LIST[@]}"; do
-  addr="${addr// /}"
-  if [[ -n "$addr" ]]; then
-    SERVER_ADDR_LIST_CLEAN+=("$addr")
-  fi
-done
-SERVER_ADDR_LIST=("${SERVER_ADDR_LIST_CLEAN[@]}")
-
 NAME=${NAME:-$(hostname -s | sed 's/[^A-Za-z0-9]/_/g')}
 NAME="$(printf '%s' "${NAME}" | sed 's/[^A-Za-z0-9]/_/g')"
 MESH_PREFIX="${MESH_IP%.*}"
@@ -552,6 +579,33 @@ if [[ -z "${XRAY_CONFIG:-}" ]]; then
     XRAY_CONFIG="/usr/local/etc/xray/config.json"
   fi
 fi
+
+SERVER_ADDR_RAW="$SERVER_ADDR"
+SERVER_ADDR_ACTIVE=""
+SERVER_ADDR_LIST=()
+SERVER_ADDR_LIST_CLEAN=()
+SERVER_ADDR_LIST_PRIMARY=()
+SERVER_ADDR_LIST_NORMAL=()
+SERVER_ADDR_LIST_LAST=()
+IFS=',' read -r -a SERVER_ADDR_LIST <<< "$SERVER_ADDR_RAW"
+for addr in "${SERVER_ADDR_LIST[@]}"; do
+  addr="${addr// /}"
+  if [[ -n "$addr" ]]; then
+    SERVER_ADDR_LIST_CLEAN+=("$addr")
+  fi
+done
+for addr in "${SERVER_ADDR_LIST_CLEAN[@]}"; do
+  if [[ "$(same_private_24 "$PUB_ADDR" "$addr")" == "yes" ]]; then
+    SERVER_ADDR_LIST_PRIMARY+=("$addr")
+    continue
+  fi
+  if [[ "$(is_private_ip "$addr")" == "yes" ]]; then
+    SERVER_ADDR_LIST_LAST+=("$addr")
+    continue
+  fi
+  SERVER_ADDR_LIST_NORMAL+=("$addr")
+done
+SERVER_ADDR_LIST=("${SERVER_ADDR_LIST_PRIMARY[@]}" "${SERVER_ADDR_LIST_NORMAL[@]}" "${SERVER_ADDR_LIST_LAST[@]}")
 
 # Reality keys
 if [[ -f "$SELF_JSON" ]]; then
@@ -643,7 +697,7 @@ REG_URL=""
 
 try_registry() {
   local base="$1"
-  if curl -fsS -H "X-Mesh-Token: $TOKEN" "${base}/peers" -o "$TMP"; then
+  if curl -fsS --connect-timeout 3 --max-time 6 -H "X-Mesh-Token: $TOKEN" "${base}/peers" -o "$TMP"; then
     REG_BASE="$base"
     PEERS_URL="${REG_BASE}/peers"
     REG_URL="${REG_BASE}/register"
@@ -780,18 +834,30 @@ for p in peers:
         continue
     if not p.get('accept', True):
         continue
-    peer_pub=p['pub_addr']
+    peer_pub=(p.get('pub_addr') or '').strip()
+    peer_lan=(p.get('lan_ip') or '').strip()
+    peer_port=int(p.get('tinc_port',tinc_port))
+    direct_addr=""
     use_direct=False
     if local_net:
-        try:
-            pip=ipaddress.ip_address(peer_pub)
+        for candidate in (peer_lan, peer_pub):
+            if not candidate:
+                continue
+            try:
+                pip=ipaddress.ip_address(candidate)
+            except Exception:
+                continue
             if pip.is_private and pip in local_net:
+                direct_addr=candidate
                 use_direct=True
-        except Exception:
-            pass
-    if not use_direct:
-        peer_port=int(p.get('tinc_port',tinc_port))
-        if peer_pub and can_direct(peer_pub, peer_port):
+                break
+    if not use_direct and peer_lan:
+        if can_direct(peer_lan, peer_port):
+            direct_addr=peer_lan
+            use_direct=True
+    if not use_direct and peer_pub:
+        if can_direct(peer_pub, peer_port):
+            direct_addr=peer_pub
             use_direct=True
 
     if use_direct:
@@ -801,7 +867,7 @@ for p in peers:
             if line.startswith('-----BEGIN RSA PUBLIC KEY-----'): grab=True
             if grab: rsa_lines.append(line)
             if line.startswith('-----END RSA PUBLIC KEY-----'): break
-        host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = {peer_pub}\nPort = {p['tinc_port']}\n"+"\n".join(rsa_lines)+"\n"
+        host_content=f"Subnet = {p['mesh_ip']}/32\nAddress = {direct_addr}\nPort = {peer_port}\n"+"\n".join(rsa_lines)+"\n"
         os.makedirs(hosts_dir, exist_ok=True)
         open(os.path.join(hosts_dir,p['name']),'w').write(host_content)
         connect_lines.append(f"ConnectTo = {p['name']}")
@@ -904,8 +970,10 @@ EOF
   SERVER_MESH_IP="$(jq -r '.peers[] | select(.name=="server") | .mesh_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
   SERVER_LAN_IP="$(jq -r '.peers[] | select(.name=="server") | .lan_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
   if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
-    for _ in {1..10}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
-    ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+    if [[ "$(same_private_24 "$PUB_ADDR" "$SERVER_LAN_IP")" != "yes" ]]; then
+      for _ in {1..10}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
+      ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+    fi
   fi
   if [[ -n "${SERVER_MESH_IP}" && "${SERVER_MESH_IP}" != "${MESH_IP}" && "${REG_PORT}" != "${VLESS_PORT}" ]]; then
     write_registry_relay "${SERVER_MESH_IP}" "${REG_PORT}" "${REG_PORT}"
@@ -1013,8 +1081,10 @@ elif [[ "$DEPLOY" == "k8s" ]]; then
   SERVER_MESH_IP="$(jq -r '.peers[] | select(.name=="server") | .mesh_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
   SERVER_LAN_IP="$(jq -r '.peers[] | select(.name=="server") | .lan_ip // empty' /etc/vless-mesh/peers.json 2>/dev/null || true)"
   if [[ -n "${SERVER_MESH_IP}" && -n "${SERVER_LAN_IP}" ]]; then
-    for _ in {1..20}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
-    ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+    if [[ "$(same_private_24 "$PUB_ADDR" "$SERVER_LAN_IP")" != "yes" ]]; then
+      for _ in {1..20}; do ip link show mesh0 >/dev/null 2>&1 && break; sleep 1; done
+      ip route replace "${SERVER_LAN_IP}/32" via "${SERVER_MESH_IP}" dev mesh0 >/dev/null 2>&1 || true
+    fi
   fi
   if [[ -n "${SERVER_MESH_IP}" && "${SERVER_MESH_IP}" != "${MESH_IP}" && "${REG_PORT}" != "${VLESS_PORT}" ]]; then
     write_registry_relay "${SERVER_MESH_IP}" "${REG_PORT}" "${REG_PORT}"

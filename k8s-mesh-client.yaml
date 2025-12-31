@@ -36,6 +36,19 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoSchedule"
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -45,6 +58,17 @@ spec:
                     operator: DoesNotExist
                   - key: node-role.kubernetes.io/master
                     operator: DoesNotExist
+                  - key: vless-mesh
+                    operator: DoesNotExist
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: vless-mesh
+                    operator: NotIn
+                    values:
+                      - host
       containers:
       - name: mesh-client
         image: registry:443/vless-mesh-node:latest

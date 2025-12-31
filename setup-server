@@ -359,6 +359,9 @@ apply_k8s_clients() {
   local ns="vless-mesh"
   local image="$IMAGE_TAG"
   local server_addr="$PUB_ADDR"
+  if [[ -n "${LAN_IP:-}" && "${LAN_IP}" != "${PUB_ADDR}" ]]; then
+    server_addr="${LAN_IP},${PUB_ADDR}"
+  fi
 
   k create ns "$ns" --dry-run=client -o yaml | k apply -f -
 
@@ -398,6 +401,19 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoSchedule"
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
